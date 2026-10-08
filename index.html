@@ -413,7 +413,7 @@
 
   /* ================= Firestore via REST (mesma técnica do app de EPI) ================= */
   function makeRestDb(){
-    var DOCROOT = 'projects/'+firebaseConfig.projectId+'/databases/(default)/documents';
+    var DOCROOT = 'projects/'+firebaseConfig.projectId+'/databases/default/documents';
     var BASE = 'https://firestore.googleapis.com/v1/'+DOCROOT;
     /* Gravações via POST :commit (algumas redes/antivírus bloqueiam o método PATCH) */
     async function commitWrite(path, data, mask){
