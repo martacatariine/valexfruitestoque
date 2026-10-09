@@ -600,9 +600,12 @@
     var pill=document.getElementById('sync-pill'), t=document.getElementById('sync-text');
     pill.classList.toggle('local', !ok); t.textContent = txt;
   }
+  var ultimoErroBanco = '';
   function permErr(e){
+    ultimoErroBanco = (e && e.message ? e.message : String(e||'')).slice(0,400);
     if(e && e.status===403) setSync(false, 'Sem permissão no banco — veja a aba Usuários');
     else setSync(false, 'Sem conexão — tentando de novo…');
+    var pill=document.getElementById('sync-pill'); if(pill) pill.title = ultimoErroBanco;
   }
   function subscribeAll(){
     if(subscribed) return; subscribed = true;
@@ -611,7 +614,7 @@
         .sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
       var ultima = state.importacoes[0];
       if(ultima && (!state.base || state.base.importId!==ultima.id)) carregarBase();
-      setSync(true, 'Sincronizado — dados salvos para toda a equipe');
+      setSync(true, 'Sincronizado — dados salvos para toda a equipe'); ultimoErroBanco='';
       render();
     }, permErr);
     db.collection('emb_contagens').onSnapshot(function(snap){
@@ -663,10 +666,30 @@
     return -1;
   }
 
+  /* Acha a aba do estoque fiscal de embalagens pelo nome ou, se o nome mudar, pelas colunas */
+  function acharAbaFiscal(wb){
+    var nomes = wb.SheetNames;
+    var porNome = nomes.find(function(n){ var N=norm(n); return N.indexOf('ESTOQUE')>=0 && N.indexOf('EMB')>=0; });
+    if(porNome) return porNome;
+    var candidatos = nomes.filter(function(n){
+      var N=norm(n); if(N.indexOf('ENTRADA')===0 || N.indexOf('SAIDA')===0) return false;
+      var h=(sheetRows(wb.Sheets[n])[0]||[]);
+      return findCol(h,['COD PRODUTO','COD DO PRODUTO','CODIGO','COD'])>=0 && findCol(h,['ESTOQUE FISCAL DISPONIVEL','ESTOQUE FISCAL','ESTOQUE','SALDO'])>=0;
+    });
+    var semUva = candidatos.filter(function(n){ return norm(n).indexOf('UVA')<0; });
+    if(semUva.length) return semUva[0];
+    for(var i=0;i<candidatos.length;i++){
+      var rows=sheetRows(wb.Sheets[candidatos[i]]), h=rows[0]||[], cc=findCol(h,['COD PRODUTO','COD DO PRODUTO','CODIGO','COD']), emb=0, tot=0;
+      for(var j=1;j<rows.length;j++){ var c=rows[j]&&rows[j][cc]; if(c==null||c==='') continue; tot++; if(/^[45]/.test(String(c).trim())) emb++; }
+      if(tot && emb/tot>0.5) return candidatos[i];
+    }
+    return null;
+  }
+
   function lerPlanilha(wb, nomeArquivo){
     var res = { arquivo:nomeArquivo, abas:[], avisos:[], produtos:[], movimentos:[], dataBase:'', horaBase:'', ignorados:{} };
-    var fiscalName = wb.SheetNames.find(function(n){ var N=norm(n); return N.indexOf('ESTOQUE')>=0 && N.indexOf('EMBALAG')>=0; });
-    if(!fiscalName){ res.erro = 'Não encontrei a aba "ESTOQUE FISCAL EMBALAGENS" na planilha.'; return res; }
+    var fiscalName = acharAbaFiscal(wb);
+    if(!fiscalName){ res.erro = 'Não encontrei a aba de estoque fiscal de embalagens. Abas encontradas neste arquivo: '+wb.SheetNames.join(' · ')+'. A aba precisa ter as colunas COD. PRODUTO, DESCRIÇÃO DO PRODUTO e ESTOQUE FISCAL.'; return res; }
 
     // 1) Estoque fiscal de embalagens (cadastro de itens)
     var fr = sheetRows(wb.Sheets[fiscalName]);
@@ -766,7 +789,7 @@
       state.importacoes.unshift({id:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase, periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length});
       state.preview = null; state.tab='estoque';
     }catch(e){
-      alert(e && e.status===403 ? 'O banco recusou a gravação (permissão). Veja na aba Usuários as regras que precisam ser liberadas no Firebase.' : 'Não foi possível salvar a planilha agora. Tente novamente.');
+      alert((e && e.status===403 ? 'O banco recusou a gravação (permissão).' : 'Não foi possível salvar a planilha agora.')+'\n\nDetalhe técnico: '+(e && e.message ? e.message.slice(0,300) : e));
     }
     state.importando=false; render();
   }
@@ -1255,8 +1278,9 @@
     var hist = state.importacoes.length ? state.importacoes.map(function(i,ix){
       return '<tr><td>'+fmtDateTimeBR(i.importadoEm)+(ix===0?' <span class="chip chip-good">em uso</span>':'')+'</td><td>'+esc(i.arquivo)+'</td><td>'+fmtDateBR(i.dataBase)+' '+esc(i.horaBase||'')+'</td><td>'+fmtDateBR(i.periodoIni)+' a '+fmtDateBR(i.periodoFim)+'</td><td class="num">'+(i.itens||0)+'</td><td class="num">'+(i.movimentos||0)+'</td><td>'+esc(i.importadoPor||'')+'</td></tr>';
     }).join('') : '<tr><td colspan="7"><div class="empty-msg">Nenhuma importação ainda.</div></td></tr>';
+    var diag = ultimoErroBanco ? '<div class="auth-error" style="margin-bottom:14px">Aviso do banco de dados: '+esc(ultimoErroBanco)+'</div>' : '';
     return '<section class="tab-section">'+
-      '<div class="section-head"><h2>Importar planilha Excel</h2></div>'+
+      '<div class="section-head"><h2>Importar planilha Excel</h2></div>'+diag+
       (admin ? '<div class="dropzone" data-action="pick-file" id="dropzone"><div class="big">Clique ou arraste a planilha aqui</div><div class="hint">BASE PARA RELATÓRIOS – CONTROLE DE ESTOQUE (.xlsx) · abas ENTRADAS MATRIZ/FILIAL, SAIDAS MATRIZ/FILIAL e ESTOQUE FISCAL EMBALAGENS</div></div>'
              : '<div class="hint-box">Somente administradores importam a planilha. Você pode usar as demais abas normalmente.</div>')+
       prev+
