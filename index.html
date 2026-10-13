@@ -289,6 +289,7 @@
   @media (max-width:640px){ .shell{padding:16px 16px 56px;} section.tab-section{padding:16px;} .search-input{min-width:0;flex:1 1 160px;} }
   table.wide{min-width:1150px;}
   td.desc{min-width:240px;}
+  .tag{white-space:nowrap;}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
@@ -689,7 +690,7 @@
   }
 
   function lerPlanilha(wb, nomeArquivo){
-    var res = { arquivo:nomeArquivo, abas:[], avisos:[], produtos:[], movimentos:[], dataBase:'', horaBase:'', ignorados:{} };
+    var res = { arquivo:nomeArquivo, abas:[], avisos:[], produtos:[], movimentos:[], dataBase:'', horaBase:'', ignorados:{}, insumoCad:{}, insumoMovs:[] };
     var fiscalName = acharAbaFiscal(wb);
     if(!fiscalName){ res.erro = 'Não encontrei a aba de estoque fiscal de embalagens. Abas encontradas neste arquivo: '+wb.SheetNames.join(' · ')+'. A aba precisa ter as colunas COD. PRODUTO, DESCRIÇÃO DO PRODUTO e ESTOQUE FISCAL.'; return res; }
 
@@ -734,7 +735,11 @@
         lidas++;
         var cod=String(r[iC]).trim();
         if(!codigos[cod]){
-          if(/^[45]/.test(cod)){ var nm=String(r[iD]||cod); res.ignorados[cod]=nm; }
+          if(/^[45]/.test(cod)){
+            var nm=String(r[iD]||cod).trim(); res.insumoCad[cod]=nm;
+            res.insumoMovs.push({ u:u, t:tipo, nf: r[iNF]!=null?String(r[iNF]):'', dt: toISODate(r[iDt]), p: String(r[iP]||'').trim(), doc: iDoc>=0?String(r[iDoc]||''):'',
+              op: String(r[iOp]||'').trim(), c:cod, q:r6(toNum(r[iQ])), v: iT>=0?Math.round(toNum(r[iT])*100)/100:0, m: iMv>=0 ? norm(r[iMv])==='SIM' : true });
+          }
           continue;
         }
         emb++;
@@ -781,7 +786,7 @@
       var id = 'imp-'+Date.now().toString(36);
       var agora = new Date().toISOString();
       var base = { importId:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase,
-        periodo:p.periodo, produtos:p.produtos, movimentos:p.movimentos };
+        periodo:p.periodo, produtos:p.produtos, movimentos:p.movimentos, insumoCad:p.insumoCad, insumoMovs:p.insumoMovs };
       var tamanho = JSON.stringify(base).length;
       if(tamanho > 900000){ alert('A planilha tem movimentos demais para um único envio ('+Math.round(tamanho/1024)+' KB). Envie um período menor (ex.: um mês).'); state.importando=false; render(); return; }
       await db.doc('emb_base/atual').set(base);
@@ -1022,8 +1027,71 @@
       return true;
     });
   }
+  var LOCAIS_EST = [['todas','Matriz e Filial'],['MATRIZ','Matriz'],['FILIAL','Filial'],['dho','Depósito externo DHO'],['emp','Empréstimo de materiais de embalagens'],['embrec','Materiais de embalagens a receber'],['insrec','Insumos a receber']];
+  function ehLocalEspecial(u){ return ['dho','emp','embrec','insrec'].indexOf(u)>=0; }
+
+  /* Entrega futura: faturado (021) − recebido depois (entradas de compra com MOV. ESTOQUE = Sim, mesmo fornecedor e item) */
+  function aReceber(movs, nomeDe, unDe){
+    var g={};
+    movs.forEach(function(m){ if(m.t==='E' && codOp(m.op)==='021'){ var k=m.u+'|'+(m.doc||m.p)+'|'+m.c; var o=g[k]||(g[k]={u:m.u,p:m.p,doc:m.doc,c:m.c,fat:0,rec:0,desde:m.dt||'',ultima:'',vFat:0}); o.fat+=m.q; o.vFat+=m.v; if(m.dt && (!o.desde || m.dt<o.desde)) o.desde=m.dt; } });
+    movs.forEach(function(m){
+      if(m.t!=='E' || !m.m || codOp(m.op)==='021') return;
+      var n=norm(m.op); if(n.indexOf('COMPRA')<0 && n.indexOf('ENTREGA FUTURA')<0) return;
+      var o=g[m.u+'|'+(m.doc||m.p)+'|'+m.c]; if(!o || (m.dt && o.desde && m.dt<o.desde)) return;
+      o.rec+=m.q; if(m.dt>o.ultima) o.ultima=m.dt;
+    });
+    return Object.keys(g).map(function(k){ var o=g[k]; o.fat=r6(o.fat); o.rec=r6(o.rec); o.saldo=r6(o.fat-o.rec); o.d=nomeDe(o); o.un=unDe(o); return o; });
+  }
+  function linhasEspecial(kind){
+    var f=state.filters.estoque, q=norm(f.q), out=[];
+    var nomeEmb=function(o){ var p=IDX.prod[key(o.u,o.c)]; return p?p.d:o.c; }, unEmb=function(o){ var p=IDX.prod[key(o.u,o.c)]; return p?p.un:''; };
+    if(kind==='dho') out = saldoPorNatureza(['233'],['234']).map(function(o){ return {sit:'No depósito', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; });
+    else if(kind==='emp') out = saldoPorNatureza(['071'],['072']).map(function(o){ return {sit:'Emprestamos (a receber)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; })
+        .concat(saldoPorNatureza(['070'],['032']).map(function(o){ return {sit:'Pegamos emprestado (a devolver)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; }));
+    else if(kind==='embrec') out = aReceber(state.base.movimentos||[], nomeEmb, unEmb).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde}; });
+    else if(kind==='insrec') out = aReceber(state.base.insumoMovs||[], function(o){ return (state.base.insumoCad||{})[o.c]||o.c; }, function(){ return ''; }).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde}; });
+    return out.filter(function(o){
+      if(f.status!=='todos_esp' && Math.abs(o.saldo)<1e-9) return false;
+      if(q && norm(o.d+' '+o.c+' '+o.p+' '+o.doc).indexOf(q)<0) return false;
+      return true;
+    }).sort(function(a,b){ return a.sit.localeCompare(b.sit) || a.d.localeCompare(b.d) || a.p.localeCompare(b.p); });
+  }
+  var ESP_INFO = {
+    dho:{titulo:'Depósito externo DHO', a:'Remetido (233)', b:'Retornado (234)', s:'Saldo no depósito', parc:'Depositário', data:'Última nota', hint:'Saldo = remessas para depósito (natureza 233) − retornos do depósito (234).'},
+    emp:{titulo:'Empréstimo de materiais de embalagens', a:'Saiu/entrou (071·070)', b:'Voltou (072·032)', s:'Saldo', parc:'Parceiro', data:'Última nota', hint:'A receber = saída por empréstimo (071) − retorno de empréstimo (072). A devolver = entrada por empréstimo (070) − devolução de empréstimo (032).'},
+    embrec:{titulo:'Materiais de embalagens a receber', a:'Faturado (021)', b:'Já recebido', s:'Saldo a receber', parc:'Fornecedor', data:'Faturado desde', hint:'Saldo = notas de entrega futura (021) − entradas de compra que movimentam estoque do mesmo fornecedor e item, a partir da data da 021.'},
+    insrec:{titulo:'Insumos a receber', a:'Faturado (021)', b:'Já recebido', s:'Saldo a receber', parc:'Fornecedor', data:'Faturado desde', hint:'Insumos (Dormex, Ciatide, Kamab…) que não estão no estoque fiscal de embalagens. Saldo = entrega futura (021) − entradas de compra posteriores do mesmo fornecedor e item.'}
+  };
+  function renderEstoqueEspecial(){
+    var f=state.filters.estoque, kind=f.unidade, info=ESP_INFO[kind], L=linhasEspecial(kind);
+    var semInsumos = kind==='insrec' && !state.base.insumoMovs;
+    var tot={}; L.forEach(function(o){ var k=o.sit+'|'+o.c; var x=tot[k]||(tot[k]={sit:o.sit,d:o.d,un:o.un,saldo:0}); x.saldo=r6(x.saldo+o.saldo); });
+    var totList=Object.keys(tot).map(function(k){ return tot[k]; }).filter(function(x){ return Math.abs(x.saldo)>1e-9; });
+    var rows = L.length ? L.map(function(o){
+      return '<tr>'+(kind==='emp'?'<td><span class="tag '+(o.sit.indexOf('receber')>=0?'tag-e':'tag-s')+'">'+(o.sit.indexOf('receber')>=0?'A RECEBER':'A DEVOLVER')+'</span></td>':'')+
+        '<td>'+nomeUnidade(o.u)+'</td><td class="num">'+esc(o.c)+'</td><td class="desc"><strong>'+esc(o.d)+'</strong></td><td>'+esc(o.un)+'</td>'+
+        '<td>'+esc(o.p)+'<div class="hint">'+esc(o.doc)+'</div></td><td class="num">'+fmtN(o.a)+'</td><td class="num">'+fmtN(o.b)+'</td>'+
+        '<td class="num"><strong class="'+(o.saldo<0?'neg':'')+'">'+fmtN(o.saldo)+'</strong></td><td>'+fmtDateBR(o.data)+'</td></tr>'; }).join('')
+      : '<tr><td colspan="10"><div class="empty-msg">'+(semInsumos?'A planilha atual foi importada antes desta versão. Importe a planilha de novo para ver os insumos.':'Nenhum saldo encontrado na planilha importada.')+'</div></td></tr>';
+    var resumo = totList.length ? '<div class="panel" style="margin-bottom:16px"><h3>Total por item</h3>'+totList.map(function(x){
+      return '<div class="alert-row"><div>'+esc(x.d)+(kind==='emp'?'<div class="meta">'+esc(x.sit)+'</div>':'')+'</div><strong class="'+(x.saldo<0?'neg':'')+'">'+fmtN(x.saldo)+' '+esc(x.un)+'</strong></div>'; }).join('')+'</div>' : '';
+    return '<section class="tab-section">'+
+      '<div class="section-head"><h2>'+esc(info.titulo)+'</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-estoque">Exportar Excel</button></div></div>'+
+      '<div class="filters">'+
+        '<input class="search-input" id="f-est-q" data-filter="estoque.q" placeholder="Buscar item, código ou parceiro…" value="'+esc(f.q)+'">'+
+        sel('estoque.unidade', f.unidade, LOCAIS_EST)+
+        sel('estoque.status', f.status==='todos_esp'?'todos_esp':'saldo', [['saldo','Só com saldo'],['todos_esp','Todos, inclusive zerados']])+
+      '</div>'+
+      '<div class="hint-box">'+esc(info.hint)+' Considera só o período da planilha ('+fmtDateBR(state.base.periodo.ini)+' a '+fmtDateBR(state.base.periodo.fim)+'); saldo negativo indica movimento iniciado antes desse período.</div>'+
+      resumo+
+      '<div class="table-wrap"><table class="wide"><thead><tr>'+(kind==='emp'?'<th>Situação</th>':'')+'<th>Unid.</th><th class="num">Código</th><th>Descrição</th><th>UN</th><th>'+info.parc+'</th><th class="num">'+info.a+'</th><th class="num">'+info.b+'</th><th class="num">'+info.s+'</th><th>'+info.data+'</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+    '</section>';
+  }
+
   function renderEstoque(){
-    var f=state.filters.estoque, linhas=linhasEstoque();
+    var f=state.filters.estoque;
+    if(ehLocalEspecial(f.unidade)) return renderEstoqueEspecial();
+    var linhas=linhasEstoque();
     var rows = linhas.length ? linhas.map(function(l){ var p=l.p;
       return '<tr class="clickable" data-action="ver-kardex" data-u="'+p.u+'" data-c="'+esc(p.c)+'" title="Ver movimentações deste item">'+
         '<td>'+nomeUnidade(p.u)+'</td><td><span class="tag">'+p.mi+'</span></td><td class="num">'+esc(p.c)+'</td><td class="desc"><strong>'+esc(p.d)+'</strong></td><td>'+esc(p.un)+'</td>'+
@@ -1036,7 +1104,7 @@
       '<div class="section-head"><h2>Estoque de embalagens</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-estoque">Exportar Excel</button></div></div>'+
       '<div class="filters">'+
         '<input class="search-input" id="f-est-q" data-filter="estoque.q" placeholder="Buscar item ou código…" value="'+esc(f.q)+'">'+
-        sel('estoque.unidade', f.unidade, [['todas','Matriz e Filial'],['MATRIZ','Matriz'],['FILIAL','Filial']])+
+        sel('estoque.unidade', f.unidade, LOCAIS_EST)+
         sel('estoque.mercado', f.mercado, [['todos','MI e ME'],['MI','Mercado interno'],['ME','Mercado externo']])+
         sel('estoque.status', f.status, [['todos','Todos os status'],['critico','Cobertura crítica'],['atencao','Cobertura em atenção'],['diverge','Com divergência na contagem'],['nao','Nunca contados']])+
       '</div>'+
@@ -1048,6 +1116,14 @@
     return '<select data-filter="'+filterKey+'">'+opts.map(function(o){ return '<option value="'+esc(o[0])+'"'+(o[0]===val?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('')+'</select>';
   }
   function exportEstoque(){
+    var fu=state.filters.estoque.unidade;
+    if(ehLocalEspecial(fu)){
+      var info=ESP_INFO[fu];
+      var cabE=['Situação','Unidade','Código','Descrição','UN',info.parc,'CPF/CNPJ',info.a,info.b,info.s,info.data];
+      var linE=linhasEspecial(fu).map(function(o){ return [o.sit,nomeUnidade(o.u),o.c,o.d,o.un,o.p,o.doc,o.a,o.b,o.saldo,fmtDateBR(o.data)]; });
+      exportarExcel(fu+'-'+todayISO()+'.xlsx', [{nome:info.titulo.slice(0,31), cab:cabE, linhas:linE}]);
+      return;
+    }
     var cab=['Unidade','Mercado','Código','Descrição','UN','Estoque fiscal '+fmtDateBR(state.base.dataBase),'Entradas período','Saídas período','Consumo médio/dia','Cobertura (dias)','Última contagem (data)','Última contagem (qtd)','Fiscal na data da contagem','Diferença (contado − fiscal)'];
     var linhas = linhasEstoque().map(function(l){ var p=l.p; return [nomeUnidade(p.u),p.mi,p.c,p.d,p.un,p.q,l.r.ent,l.r.sai,Math.round(l.r.consumoDia*100)/100,l.r.cobertura==null?'':Math.round(l.r.cobertura),l.uc?fmtDateBR(l.uc.data):'',l.uc?l.uc.qtd:'',l.uc?l.uc.fiscal:'',l.dif==null?'':l.dif]; });
     exportarExcel('estoque-embalagens-'+todayISO()+'.xlsx', [{nome:'Estoque', cab:cab, linhas:linhas}]);
@@ -1352,7 +1428,7 @@
     if(p){
       if(p.erro){ prev = '<div class="auth-error" style="margin-top:16px">'+esc(p.erro)+'</div>'; }
       else{
-        var ign = Object.keys(p.ignorados);
+        var ign = Object.keys(p.insumoCad||{});
         prev = '<div style="margin-top:20px"><h3 class="section-title" style="margin-top:0">Conferência antes de salvar — '+esc(p.arquivo)+'</h3>'+
           '<div class="preview-grid">'+
             '<div class="kpi"><div class="num">'+p.produtos.length+'</div><div class="label">itens no estoque fiscal</div></div>'+
@@ -1410,7 +1486,11 @@
   }
 
   /* ================= Eventos ================= */
-  function setFilter(path, val){ var p=path.split('.'); state.filters[p[0]][p[1]]=val; render(); }
+  function setFilter(path, val){
+    var p=path.split('.'); state.filters[p[0]][p[1]]=val;
+    if(path==='estoque.unidade'){ state.filters.estoque.status = ehLocalEspecial(val) ? 'saldo' : 'todos'; }
+    render();
+  }
   function wireEvents(){
     document.addEventListener('click', function(e){
       var el = e.target.closest('[data-action]'); if(!el) return;
