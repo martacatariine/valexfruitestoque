@@ -384,7 +384,9 @@
     filters: {
       estoque:{q:'', unidade:'todas', mercado:'todos', status:'todos'},
       mov:{q:'', unidade:'todas', tipo:'todos', ini:'', fim:'', codigo:''},
-      coop:{q:'', so:'saldo'}
+      coop:{q:'', so:'saldo'},
+      dho:{q:'', so:'saldo', unidade:'todas'},
+      emp:{q:'', so:'saldo', tipo:'todos'}
     },
     contagem: { data: todayISO(), unidade: 'MATRIZ', q:'' },
     draft: {},               // valores digitados na contagem ainda não salvos: {docId:{c<cod>: '123'}}
@@ -891,6 +893,8 @@
       {id:'contagem', label:'Contagem diária'},
       {id:'movimentacoes', label:'Movimentações'},
       {id:'cooperados', label:'Em poder de cooperados'},
+      {id:'dho', label:'DHO depósito terceiro'},
+      {id:'emprestimos', label:'Empréstimos'},
       {id:'importar', label:'Importar planilha'}
     ];
     if(state.currentUser.papel==='admin') tabs.push({id:'usuarios', label:'Usuários'});
@@ -909,7 +913,7 @@
     var t=state.tab;
     if(t==='usuarios' && state.currentUser.papel!=='admin') t='painel';
     if(t!=='importar' && t!=='usuarios' && !state.base){ app.innerHTML = renderSemBase(); return; }
-    app.innerHTML = ({painel:renderPainel, estoque:renderEstoque, contagem:renderContagem, movimentacoes:renderMov, cooperados:renderCoop, importar:renderImportar, usuarios:renderUsuarios}[t]||renderPainel)();
+    app.innerHTML = ({painel:renderPainel, estoque:renderEstoque, contagem:renderContagem, movimentacoes:renderMov, cooperados:renderCoop, dho:renderDho, emprestimos:renderEmp, importar:renderImportar, usuarios:renderUsuarios}[t]||renderPainel)();
   }
 
   function renderNetErr(){
@@ -1249,6 +1253,98 @@
     exportarExcel('embalagens-em-poder-cooperados-'+todayISO()+'.xlsx', [{nome:'Em poder de cooperados', cab:cab, linhas:linhas}]);
   }
 
+
+  /* ---------- Saldos por natureza de operação (DHO e empréstimos) ---------- */
+  function codOp(op){ var m=String(op||'').match(/^\s*(\d{1,3})\b/); return m ? ('000'+m[1]).slice(-3) : ''; }
+  /* saidaOps: aumentam o saldo (material que saiu ou entrou conforme o caso); voltaOps: reduzem */
+  function saldoPorNatureza(abreOps, fechaOps){
+    var mapa={};
+    (state.base.movimentos||[]).forEach(function(m){
+      var c=codOp(m.op), abre=abreOps.indexOf(c)>=0, fecha=fechaOps.indexOf(c)>=0;
+      if(!abre && !fecha) return;
+      var k=m.u+'|'+(m.doc||m.p)+'|'+m.c;
+      var o=mapa[k]||(mapa[k]={u:m.u, p:m.p, doc:m.doc, c:m.c, abre:0, fecha:0, vAbre:0, ultima:''});
+      if(abre){ o.abre+=m.q; o.vAbre+=m.v; } else { o.fecha+=m.q; }
+      if(m.dt && m.dt>o.ultima) o.ultima=m.dt;
+    });
+    return Object.keys(mapa).map(function(k){ var o=mapa[k]; o.abre=r6(o.abre); o.fecha=r6(o.fecha); o.saldo=r6(o.abre-o.fecha); o.prod=IDX.prod[key(o.u,o.c)]; return o; });
+  }
+  function filtrarSaldo(list, f){
+    var q=norm(f.q);
+    return list.filter(function(o){
+      if(f.so==='saldo' && Math.abs(o.saldo)<1e-9) return false;
+      if(f.unidade && f.unidade!=='todas' && o.u!==f.unidade) return false;
+      if(q && norm(o.p+' '+o.doc+' '+(o.prod?o.prod.d:'')+' '+o.c).indexOf(q)<0) return false;
+      return true;
+    }).sort(function(a,b){ return a.p.localeCompare(b.p) || (a.prod?a.prod.d:'').localeCompare(b.prod?b.prod.d:''); });
+  }
+  function totaisPorItem(list){
+    var t={}; list.forEach(function(o){ var k=o.u+'|'+o.c; var x=t[k]||(t[k]={u:o.u,c:o.c,prod:o.prod,saldo:0}); x.saldo=r6(x.saldo+o.saldo); });
+    return Object.keys(t).map(function(k){ return t[k]; }).filter(function(x){ return Math.abs(x.saldo)>1e-9; })
+      .sort(function(a,b){ return (a.prod?a.prod.d:'').localeCompare(b.prod?b.prod.d:''); });
+  }
+
+  /* DHO — 233 remessa para depósito (saída) · 234 retorno do depósito (entrada) */
+  function dhoLista(){ return filtrarSaldo(saldoPorNatureza(['233'],['234']), state.filters.dho); }
+  function renderDho(){
+    var f=state.filters.dho, list=dhoLista(), tot=totaisPorItem(list);
+    var rows = list.length ? list.map(function(o){
+      return '<tr><td>'+nomeUnidade(o.u)+'</td><td><strong>'+esc(o.p)+'</strong><div class="hint">'+esc(o.doc)+'</div></td><td>'+esc(o.prod?o.prod.d:o.c)+'</td><td>'+esc(o.prod?o.prod.un:'')+'</td>'+
+        '<td class="num">'+fmtN(o.abre)+'</td><td class="num">'+fmtN(o.fecha)+'</td><td class="num"><strong class="'+(o.saldo<0?'neg':'')+'">'+fmtN(o.saldo)+'</strong></td><td>'+fmtDateBR(o.ultima)+'</td></tr>'; }).join('')
+      : '<tr><td colspan="8"><div class="empty-msg">Nenhuma nota de natureza 233/234 encontrada'+(f.so==='saldo'?' com saldo':'')+' na planilha importada.</div></td></tr>';
+    var resumo = tot.length ? '<div class="panel" style="margin-bottom:16px"><h3>Total no depósito por item</h3>'+tot.map(function(x){
+        return '<div class="alert-row"><div>'+esc(x.prod?x.prod.d:x.c)+'<div class="meta">'+nomeUnidade(x.u)+' · cód. '+esc(x.c)+'</div></div><strong>'+fmtN(x.saldo)+' '+esc(x.prod?x.prod.un:'')+'</strong></div>'; }).join('')+'</div>' : '';
+    return '<section class="tab-section">'+
+      '<div class="section-head"><h2>DHO — depósito de terceiro</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-dho">Exportar Excel</button></div></div>'+
+      '<div class="hint-box">Saldo no depósito = <strong>remessas para depósito (natureza 233)</strong> − <strong>retornos do depósito (natureza 234)</strong>, por depositário e item, dentro do período da planilha ('+fmtDateBR(state.base.periodo.ini)+' a '+fmtDateBR(state.base.periodo.fim)+'). Saldo negativo indica retorno de remessa feita antes do período.</div>'+
+      '<div class="filters"><input class="search-input" id="f-dho-q" data-filter="dho.q" placeholder="Buscar depositário ou item…" value="'+esc(f.q)+'">'+
+        sel('dho.unidade', f.unidade, [['todas','Matriz e Filial'],['MATRIZ','Matriz'],['FILIAL','Filial']])+
+        sel('dho.so', f.so, [['saldo','Só com saldo'],['todos','Todos']])+'</div>'+
+      resumo+
+      '<div class="table-wrap"><table><thead><tr><th>Unid.</th><th>Depositário</th><th>Item</th><th>UN</th><th class="num">Remetido (233)</th><th class="num">Retornado (234)</th><th class="num">Saldo no depósito</th><th>Última nota</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+    '</section>';
+  }
+  function exportDho(){
+    var cab=['Unidade','Depositário','CPF/CNPJ','Código','Item','UN','Remetido (233)','Retornado (234)','Saldo no depósito','Valor remetido','Última nota'];
+    var linhas=dhoLista().map(function(o){ return [nomeUnidade(o.u),o.p,o.doc,o.c,o.prod?o.prod.d:'',o.prod?o.prod.un:'',o.abre,o.fecha,o.saldo,Math.round(o.vAbre*100)/100,fmtDateBR(o.ultima)]; });
+    exportarExcel('dho-deposito-terceiro-'+todayISO()+'.xlsx', [{nome:'DHO deposito', cab:cab, linhas:linhas}]);
+  }
+
+  /* Empréstimos — 071 saída por empréstimo / 072 retorno (a receber) · 070 entrada por empréstimo / 032 devolução (a devolver) */
+  function empListas(){
+    var f=state.filters.emp;
+    var aReceber = (f.tipo==='devolver') ? [] : filtrarSaldo(saldoPorNatureza(['071'],['072']), f).map(function(o){ o.tipo='receber'; return o; });
+    var aDevolver = (f.tipo==='receber') ? [] : filtrarSaldo(saldoPorNatureza(['070'],['032']), f).map(function(o){ o.tipo='devolver'; return o; });
+    return {receber:aReceber, devolver:aDevolver};
+  }
+  function tabelaEmp(list, titulo, colAbre, colFecha, colSaldo){
+    var rows = list.length ? list.map(function(o){
+      return '<tr><td>'+nomeUnidade(o.u)+'</td><td><strong>'+esc(o.p)+'</strong><div class="hint">'+esc(o.doc)+'</div></td><td>'+esc(o.prod?o.prod.d:o.c)+'</td><td>'+esc(o.prod?o.prod.un:'')+'</td>'+
+        '<td class="num">'+fmtN(o.abre)+'</td><td class="num">'+fmtN(o.fecha)+'</td><td class="num"><strong class="'+(o.saldo<0?'neg':'')+'">'+fmtN(o.saldo)+'</strong></td><td>'+fmtDateBR(o.ultima)+'</td></tr>'; }).join('')
+      : '<tr><td colspan="8"><div class="empty-msg">Nenhum saldo encontrado.</div></td></tr>';
+    return '<h3 class="section-title">'+titulo+'</h3><div class="table-wrap"><table><thead><tr><th>Unid.</th><th>Parceiro</th><th>Item</th><th>UN</th><th class="num">'+colAbre+'</th><th class="num">'+colFecha+'</th><th class="num">'+colSaldo+'</th><th>Última nota</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  }
+  function renderEmp(){
+    var f=state.filters.emp, L=empListas();
+    return '<section class="tab-section">'+
+      '<div class="section-head"><h2>Empréstimos de materiais</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-emp">Exportar Excel</button></div></div>'+
+      '<div class="hint-box"><strong>Emprestamos (a receber)</strong> = saída por empréstimo (071) − retorno de empréstimo (072).<br><strong>Pegamos emprestado (a devolver)</strong> = entrada por empréstimo (070) − devolução de empréstimo (032).<br>Calculado por parceiro e item, dentro do período da planilha ('+fmtDateBR(state.base.periodo.ini)+' a '+fmtDateBR(state.base.periodo.fim)+').</div>'+
+      '<div class="kpi-grid"><div class="kpi"><div class="num">'+L.receber.filter(function(o){return o.saldo>0;}).length+'</div><div class="label">itens emprestados a terceiros (a receber)</div></div>'+
+        '<div class="kpi tone-warn"><div class="num">'+L.devolver.filter(function(o){return o.saldo>0;}).length+'</div><div class="label">itens que pegamos emprestado (a devolver)</div></div></div>'+
+      '<div class="filters"><input class="search-input" id="f-emp-q" data-filter="emp.q" placeholder="Buscar parceiro ou item…" value="'+esc(f.q)+'">'+
+        sel('emp.tipo', f.tipo, [['todos','A receber e a devolver'],['receber','Só a receber'],['devolver','Só a devolver']])+
+        sel('emp.so', f.so, [['saldo','Só com saldo'],['todos','Todos']])+'</div>'+
+      (f.tipo!=='devolver' ? tabelaEmp(L.receber, 'Emprestamos a terceiros — a receber', 'Emprestado (071)', 'Retornou (072)', 'Saldo a receber') : '')+
+      (f.tipo!=='receber' ? tabelaEmp(L.devolver, 'Pegamos emprestado — a devolver', 'Recebido (070)', 'Devolvido (032)', 'Saldo a devolver') : '')+
+    '</section>';
+  }
+  function exportEmp(){
+    var L=empListas();
+    var cab=['Situação','Unidade','Parceiro','CPF/CNPJ','Código','Item','UN','Movimento inicial','Retorno/devolução','Saldo','Última nota'];
+    var linhas=L.receber.concat(L.devolver).map(function(o){ return [o.tipo==='receber'?'A receber (071−072)':'A devolver (070−032)',nomeUnidade(o.u),o.p,o.doc,o.c,o.prod?o.prod.d:'',o.prod?o.prod.un:'',o.abre,o.fecha,o.saldo,fmtDateBR(o.ultima)]; });
+    exportarExcel('emprestimos-materiais-'+todayISO()+'.xlsx', [{nome:'Emprestimos', cab:cab, linhas:linhas}]);
+  }
+
   /* ---------- Importar ---------- */
   function renderImportar(){
     var admin = state.currentUser.papel==='admin';
@@ -1334,6 +1430,8 @@
       else if(a==='export-contagem') exportContagem();
       else if(a==='export-mov') exportMov();
       else if(a==='export-coop') exportCoop();
+      else if(a==='export-dho') exportDho();
+      else if(a==='export-emp') exportEmp();
       else if(a==='open-usuario-new'){ document.getElementById('form-usuario').reset(); document.getElementById('dlg-usuario').showModal(); }
       else if(a==='close-dialog'){ document.getElementById(el.getAttribute('data-dlg')).close(); }
       else if(a==='toggle-usuario-ativo') toggleUsuarioAtivo(el.getAttribute('data-id'));
