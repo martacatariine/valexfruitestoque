@@ -458,7 +458,7 @@
     async function req(method, url, body){
       var headers = await authHeaders();
       var resp = await fetch(url, {method:method, headers:headers, body: body!==undefined ? JSON.stringify(body) : undefined});
-      if(!resp.ok){ var txt=''; try{ txt=await resp.text(); }catch(e){} var err=new Error('Firestore REST '+resp.status+': '+txt); err.status=resp.status; throw err; }
+      if(!resp.ok){ var txt=''; try{ txt=await resp.text(); }catch(e){} var caminho=(url.split('/documents')[1]||'').split('?')[0]||'/'; var err=new Error('Firestore REST '+resp.status+' ['+method+' '+caminho+']: '+txt); err.status=resp.status; throw err; }
       var t2 = await resp.text();
       return t2 ? JSON.parse(t2) : null;
     }
@@ -471,6 +471,7 @@
           catch(e){ if(e.status===404) return {exists:false, id:id, data:function(){ return undefined; }}; throw e; }
         },
         set: async function(data){ await commitWrite(path, data, null); },
+        remove: async function(){ await req('POST', BASE+':commit', {writes:[{'delete': DOCROOT+'/'+path}]}); },
         update: async function(data){
           await commitWrite(path, data, Object.keys(data));
         },
@@ -615,8 +616,8 @@
     db.collection('emb_importacoes').onSnapshot(function(snap){
       state.importacoes = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); })
         .sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
-      var ultima = state.importacoes[0];
-      if(ultima && (!state.base || state.base.importId!==ultima.id)) carregarBase();
+      var sig = state.importacoes.map(function(i){ return i.id; }).sort().join(',');
+      if(sig && sig!==state.impSig) carregarBase();
       setSync(true, 'Sincronizado — dados salvos para toda a equipe'); ultimoErroBanco='';
       render();
     }, permErr);
@@ -631,12 +632,45 @@
     }, function(){});
     carregarBase();
   }
+  /* Junta os movimentos de todas as planilhas importadas (histórico completo).
+     Notas repetidas entre planilhas com períodos sobrepostos são contadas uma vez só. */
+  function chaveMov(m){ return [m.u,m.t,m.nf,m.dt,m.c,m.q,m.op,m.doc].join('|'); }
+  function mesclarLista(listas){
+    var maxCont={}, porChave={};
+    listas.forEach(function(lst){
+      var cont={};
+      (lst||[]).forEach(function(m){ var k=chaveMov(m); cont[k]=(cont[k]||0)+1; if(!porChave[k]) porChave[k]=m; });
+      Object.keys(cont).forEach(function(k){ if(!maxCont[k] || cont[k]>maxCont[k]) maxCont[k]=cont[k]; });
+    });
+    var out=[]; Object.keys(maxCont).forEach(function(k){ for(var i=0;i<maxCont[k];i++) out.push(porChave[k]); });
+    return out;
+  }
+  function mesclarHistorico(base, imps){
+    var b = Object.assign({}, base);
+    if(!imps.length) return b;
+    b.movimentos = mesclarLista(imps.map(function(i){ return i.movimentos; }));
+    b.insumoMovs = mesclarLista(imps.map(function(i){ return i.insumoMovs; }));
+    b.insumoCad = {}; imps.forEach(function(i){ Object.assign(b.insumoCad, i.insumoCad||{}); });
+    var datas = b.movimentos.map(function(m){ return m.dt; }).filter(Boolean).sort();
+    b.periodo = { ini: datas[0]||'', fim: datas[datas.length-1]||'' };
+    b.qtdPlanilhas = imps.length;
+    return b;
+  }
   var carregandoBase = false;
   async function carregarBase(){
     if(carregandoBase) return; carregandoBase = true;
     try{
       var doc = await db.doc('emb_base/atual').get();
-      state.base = doc.exists ? doc.data() : null;
+      var base = doc.exists ? doc.data() : null;
+      var imps = [];
+      try{ var snap = await db.collection('emb_imports').get(); imps = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); }); }
+      catch(e){ permErr(e); }
+      state.legacy = (base && base.movimentos && base.movimentos.length) ? base : null;
+      if(state.legacy && !imps.some(function(i){ return i.id===base.importId; })){
+        imps.push({id:base.importId, importadoEm:base.importadoEm, arquivo:base.arquivo, periodo:base.periodo, movimentos:base.movimentos, insumoMovs:base.insumoMovs||[], insumoCad:base.insumoCad||{}});
+      }
+      state.base = base ? mesclarHistorico(base, imps) : null;
+      state.impSig = state.importacoes.map(function(i){ return i.id; }).sort().join(',');
       indexarBase();
       render();
     }catch(e){ permErr(e); }
@@ -785,20 +819,40 @@
     try{
       var id = 'imp-'+Date.now().toString(36);
       var agora = new Date().toISOString();
-      var base = { importId:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase,
-        periodo:p.periodo, produtos:p.produtos, movimentos:p.movimentos, insumoCad:p.insumoCad, insumoMovs:p.insumoMovs };
-      var tamanho = JSON.stringify(base).length;
+      var imp = { importId:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, periodo:p.periodo,
+        movimentos:p.movimentos, insumoCad:p.insumoCad, insumoMovs:p.insumoMovs };
+      var tamanho = JSON.stringify(imp).length;
       if(tamanho > 900000){ alert('A planilha tem movimentos demais para um único envio ('+Math.round(tamanho/1024)+' KB). Envie um período menor (ex.: um mês).'); state.importando=false; render(); return; }
+      /* guarda a base antiga (formato anterior) no histórico antes de substituir */
+      if(state.legacy){
+        var lg=state.legacy;
+        await db.doc('emb_imports/'+lg.importId).set({ importId:lg.importId, importadoEm:lg.importadoEm||agora, importadoPor:lg.importadoPor||'', arquivo:lg.arquivo||'', periodo:lg.periodo||{}, movimentos:lg.movimentos||[], insumoCad:lg.insumoCad||{}, insumoMovs:lg.insumoMovs||[] });
+        state.legacy = null;
+      }
+      await db.doc('emb_imports/'+id).set(imp);
+      var base = { importId:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase, periodoArquivo:p.periodo, produtos:p.produtos };
       await db.doc('emb_base/atual').set(base);
       await db.doc('emb_importacoes/'+id).set({ importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase,
         periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length });
-      state.base = base; indexarBase();
+      state.impSig = '';
       state.importacoes.unshift({id:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase, periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length});
       state.preview = null; state.tab='estoque';
+      await carregarBase();
     }catch(e){
       alert((e && e.status===403 ? 'O banco recusou a gravação (permissão).' : 'Não foi possível salvar a planilha agora.')+'\n\nDetalhe técnico: '+(e && e.message ? e.message.slice(0,300) : e));
     }
     state.importando=false; render();
+  }
+
+  async function excluirImportacao(id){
+    var i = state.importacoes.find(function(x){ return x.id===id; }); if(!i) return;
+    if(!confirm('Excluir do histórico a planilha "'+(i.arquivo||id)+'" importada em '+fmtDateTimeBR(i.importadoEm)+'?\n\nAs notas dela saem dos relatórios (as que também estão em outras planilhas continuam).')) return;
+    try{
+      await db.doc('emb_imports/'+id).remove();
+      await db.doc('emb_importacoes/'+id).remove();
+      state.importacoes = state.importacoes.filter(function(x){ return x.id!==id; });
+      state.impSig=''; await carregarBase();
+    }catch(e){ alert('Não foi possível excluir agora.\n\nDetalhe técnico: '+(e && e.message ? e.message.slice(0,300) : e)); }
   }
 
   /* ================= Cálculos ================= */
@@ -809,16 +863,22 @@
     (state.base.produtos||[]).forEach(function(p){ IDX.prod[key(p.u,p.c)] = p; });
     (state.base.movimentos||[]).forEach(function(m){ var k=key(m.u,m.c); (IDX.movPorItem[k]=IDX.movPorItem[k]||[]).push(m); });
   }
-  function diasPeriodo(){
-    var b=state.base; if(!b || !b.periodo || !b.periodo.ini) return 1;
+  var JANELA_DIAS = 60;
+  function janela(){
+    var b=state.base; if(!b || !b.periodo || !b.periodo.ini) return {ini:'', fim:'', dias:1};
     var fim = b.dataBase && b.dataBase>b.periodo.fim ? b.dataBase : b.periodo.fim;
-    return Math.max(1, daysBetweenISO(b.periodo.ini, fim)+1);
+    var d=new Date(fim+'T00:00:00'); d.setDate(d.getDate()-(JANELA_DIAS-1));
+    var iniJ = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    var ini = b.periodo.ini > iniJ ? b.periodo.ini : iniJ;
+    return {ini:ini, fim:fim, dias:Math.max(1, daysBetweenISO(ini, fim)+1)};
   }
+  function diasPeriodo(){ return janela().dias; }
   function resumoItem(p){
     var movs = IDX.movPorItem[key(p.u,p.c)] || [];
     var ent=0, sai=0;
-    movs.forEach(function(m){ if(!m.m) return; if(m.t==='E') ent+=m.q; else sai+=m.q; });
-    var consumoDia = sai / diasPeriodo();
+    var J=janela();
+    movs.forEach(function(m){ if(!m.m || (m.dt && m.dt<J.ini)) return; if(m.t==='E') ent+=m.q; else sai+=m.q; });
+    var consumoDia = sai / J.dias;
     var cobertura = consumoDia>0 ? p.q/consumoDia : null;
     return { ent:r6(ent), sai:r6(sai), consumoDia:consumoDia, cobertura:cobertura };
   }
@@ -951,7 +1011,7 @@
   }
   function baseInfoLine(){
     var b=state.base;
-    return '<div class="hint">Base fiscal de <strong>'+fmtDateBR(b.dataBase)+(b.horaBase?' '+esc(b.horaBase):'')+'</strong> · movimentos de '+fmtDateBR(b.periodo&&b.periodo.ini)+' a '+fmtDateBR(b.periodo&&b.periodo.fim)+' · arquivo '+esc(b.arquivo)+'</div>';
+    return '<div class="hint">Base fiscal de <strong>'+fmtDateBR(b.dataBase)+(b.horaBase?' '+esc(b.horaBase):'')+'</strong> (arquivo '+esc(b.arquivo)+') · histórico de notas de '+fmtDateBR(b.periodo&&b.periodo.ini)+' a '+fmtDateBR(b.periodo&&b.periodo.fim)+(b.qtdPlanilhas?' · '+b.qtdPlanilhas+' planilha(s) importada(s)':'')+'</div>';
   }
 
   /* ---------- Painel ---------- */
@@ -1004,7 +1064,7 @@
       : '<div class="empty-msg">'+(state.contagens.length?'Nenhuma divergência na última contagem.':'Nenhuma contagem registrada ainda.')+'</div>')+
     '</div>';
     return kpis+'<div class="panels-grid">'+pCont+pCrit+pDiv+'</div>'+baseInfoLine()+
-      '<div class="hint" style="margin-top:6px">Cobertura = estoque fiscal ÷ consumo médio diário (saídas que movimentam estoque no período da planilha).</div>';
+      '<div class="hint" style="margin-top:6px">Cobertura = estoque fiscal ÷ consumo médio diário (saídas que movimentam estoque nos últimos '+JANELA_DIAS+' dias do histórico).</div>';
   }
 
   /* ---------- Estoque ---------- */
@@ -1109,7 +1169,7 @@
         sel('estoque.status', f.status, [['todos','Todos os status'],['critico','Cobertura crítica'],['atencao','Cobertura em atenção'],['diverge','Com divergência na contagem'],['nao','Nunca contados']])+
       '</div>'+
       '<div class="table-wrap"><table class="wide"><thead><tr><th>Unid.</th><th>Merc.</th><th class="num">Código</th><th>Descrição</th><th>UN</th><th class="num">Estoque fiscal</th><th class="num">Entradas</th><th class="num">Saídas</th><th class="num">Consumo/dia</th><th>Cobertura</th><th class="num">Última contagem</th><th>Contagem × fiscal</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
-      '<div style="margin-top:10px">'+baseInfoLine()+'<div class="hint">Entradas e saídas consideram só as notas com "MOV. ESTOQUE = Sim". Clique em um item para ver as notas.</div></div>'+
+      '<div style="margin-top:10px">'+baseInfoLine()+'<div class="hint">Entradas, saídas e consumo/dia: últimos '+JANELA_DIAS+' dias do histórico ('+fmtDateBR(janela().ini)+' a '+fmtDateBR(janela().fim)+'), só notas com "MOV. ESTOQUE = Sim". Clique em um item para ver as notas.</div></div>'+
     '</section>';
   }
   function sel(filterKey, val, opts){
@@ -1443,13 +1503,15 @@
           (ign.length?'<div class="hint" style="margin-top:10px">Ignorados por não estarem no estoque fiscal de embalagens ('+ign.length+'): '+ign.slice(0,12).map(function(c){ return esc(p.ignorados[c]); }).join(', ')+(ign.length>12?'…':'')+'</div>':'')+
           '<div class="hint" style="margin-top:6px">A aba de estoque fiscal de UVA não é usada neste app.</div>'+
           '<div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap"><button class="btn btn-primary" data-action="salvar-importacao"'+(state.importando?' disabled':'')+'>'+(state.importando?'Salvando…':'Salvar como base atual')+'</button><button class="btn btn-secondary" data-action="cancelar-preview">Cancelar</button></div>'+
-          '<div class="hint" style="margin-top:8px">Ao salvar, esta planilha substitui a base anterior para toda a equipe. As contagens já feitas são mantidas.</div>'+
+          '<div class="hint" style="margin-top:8px">Ao salvar, as notas desta planilha são <strong>somadas ao histórico</strong> (notas repetidas de períodos sobrepostos entram uma vez só) e o estoque fiscal passa a ser o desta planilha. As contagens já feitas são mantidas.</div>'+
         '</div>';
       }
     }
     var hist = state.importacoes.length ? state.importacoes.map(function(i,ix){
-      return '<tr><td>'+fmtDateTimeBR(i.importadoEm)+(ix===0?' <span class="chip chip-good">em uso</span>':'')+'</td><td>'+esc(i.arquivo)+'</td><td>'+fmtDateBR(i.dataBase)+' '+esc(i.horaBase||'')+'</td><td>'+fmtDateBR(i.periodoIni)+' a '+fmtDateBR(i.periodoFim)+'</td><td class="num">'+(i.itens||0)+'</td><td class="num">'+(i.movimentos||0)+'</td><td>'+esc(i.importadoPor||'')+'</td></tr>';
-    }).join('') : '<tr><td colspan="7"><div class="empty-msg">Nenhuma importação ainda.</div></td></tr>';
+      var podeExcluir = admin && ix>0;
+      return '<tr><td>'+fmtDateTimeBR(i.importadoEm)+(ix===0?' <span class="chip chip-good">estoque fiscal em uso</span>':'')+'</td><td>'+esc(i.arquivo)+'</td><td>'+fmtDateBR(i.dataBase)+' '+esc(i.horaBase||'')+'</td><td>'+fmtDateBR(i.periodoIni)+' a '+fmtDateBR(i.periodoFim)+'</td><td class="num">'+(i.itens||0)+'</td><td class="num">'+(i.movimentos||0)+'</td><td>'+esc(i.importadoPor||'')+'</td>'+
+        '<td>'+(podeExcluir?'<button class="btn btn-danger" data-action="excluir-import" data-id="'+esc(i.id)+'">Excluir</button>':'')+'</td></tr>';
+    }).join('') : '<tr><td colspan="8"><div class="empty-msg">Nenhuma importação ainda.</div></td></tr>';
     var diag = ultimoErroBanco ? '<div class="auth-error" style="margin-bottom:14px">Aviso do banco de dados: '+esc(ultimoErroBanco)+'</div>' : '';
     return '<section class="tab-section">'+
       '<div class="section-head"><h2>Importar planilha Excel</h2></div>'+diag+
@@ -1458,7 +1520,7 @@
       prev+
     '</section>'+
     '<section class="tab-section"><div class="section-head"><h2>Histórico de importações</h2></div>'+
-      '<div class="table-wrap"><table><thead><tr><th>Importado em</th><th>Arquivo</th><th>Base fiscal</th><th>Período das notas</th><th class="num">Itens</th><th class="num">Notas</th><th>Por</th></tr></thead><tbody>'+hist+'</tbody></table></div></section>';
+      '<div class="table-wrap"><table><thead><tr><th>Importado em</th><th>Arquivo</th><th>Base fiscal</th><th>Período das notas</th><th class="num">Itens</th><th class="num">Notas</th><th>Por</th><th></th></tr></thead><tbody>'+hist+'</tbody></table></div></section>';
   }
 
   /* ---------- Usuários ---------- */
@@ -1510,6 +1572,7 @@
       else if(a==='export-contagem') exportContagem();
       else if(a==='export-mov') exportMov();
       else if(a==='export-coop') exportCoop();
+      else if(a==='excluir-import') excluirImportacao(el.getAttribute('data-id'));
       else if(a==='export-dho') exportDho();
       else if(a==='export-emp') exportEmp();
       else if(a==='open-usuario-new'){ document.getElementById('form-usuario').reset(); document.getElementById('dlg-usuario').showModal(); }
