@@ -387,7 +387,9 @@
       mov:{q:'', unidade:'todas', tipo:'todos', ini:'', fim:'', codigo:''},
       coop:{q:'', so:'saldo'},
       dho:{q:'', so:'saldo', unidade:'todas'},
-      emp:{q:'', so:'saldo', tipo:'todos'}
+      emp:{q:'', so:'saldo', tipo:'todos'},
+      insrec:{q:'', status:'saldo'},
+      embrec:{q:'', status:'saldo'}
     },
     contagem: { data: todayISO(), unidade: 'MATRIZ', q:'' },
     draft: {},               // valores digitados na contagem ainda não salvos: {docId:{c<cod>: '123'}}
@@ -1017,6 +1019,8 @@
       {id:'cooperados', label:'Em poder de cooperados'},
       {id:'dho', label:'DHO depósito terceiro'},
       {id:'emprestimos', label:'Empréstimos'},
+      {id:'insrec', label:'Insumos a receber'},
+      {id:'embrec', label:'Embalagens a receber'},
       {id:'importar', label:'Importar planilha'}
     ];
     if(state.currentUser.papel==='admin') tabs.push({id:'usuarios', label:'Usuários'});
@@ -1035,7 +1039,7 @@
     var t=state.tab;
     if(t==='usuarios' && state.currentUser.papel!=='admin') t='painel';
     if(t!=='importar' && t!=='usuarios' && !state.base){ app.innerHTML = renderSemBase(); return; }
-    app.innerHTML = ({painel:renderPainel, estoque:renderEstoque, contagem:renderContagem, movimentacoes:renderMov, cooperados:renderCoop, dho:renderDho, emprestimos:renderEmp, importar:renderImportar, usuarios:renderUsuarios}[t]||renderPainel)();
+    app.innerHTML = ({painel:renderPainel, estoque:renderEstoque, contagem:renderContagem, movimentacoes:renderMov, cooperados:renderCoop, dho:renderDho, emprestimos:renderEmp, insrec:function(){ return renderAReceber('insrec'); }, embrec:function(){ return renderAReceber('embrec'); }, importar:renderImportar, usuarios:renderUsuarios}[t]||renderPainel)();
   }
 
   function renderNetErr(){
@@ -1148,25 +1152,25 @@
   function ehLocalEspecial(u){ return ['dho','emp','embrec','insrec'].indexOf(u)>=0; }
 
   /* Entrega futura: faturado (021) − recebido depois (entradas de compra com MOV. ESTOQUE = Sim, mesmo fornecedor e item) */
-  function aReceber(movs, nomeDe, unDe){
+  function aReceber(movs, nomeDe, unDe, filhaOps){
     var g={};
-    movs.forEach(function(m){ if(m.t==='E' && codOp(m.op)==='021'){ var k=m.u+'|'+(m.doc||m.p)+'|'+m.c; var o=g[k]||(g[k]={u:m.u,p:m.p,doc:m.doc,c:m.c,fat:0,rec:0,desde:m.dt||'',ultima:'',vFat:0}); o.fat+=m.q; o.vFat+=m.v; if(m.dt && (!o.desde || m.dt<o.desde)) o.desde=m.dt; } });
+    movs.forEach(function(m){ if(m.t==='E' && codOp(m.op)==='021'){ var k=m.u+'|'+(m.doc||m.p)+'|'+m.c; var o=g[k]||(g[k]={u:m.u,p:m.p,doc:m.doc,c:m.c,fat:0,rec:0,desde:m.dt||'',ultima:'',vFat:0,nfs:[],nfsFilha:[]}); o.fat+=m.q; o.vFat+=m.v; if(m.nf && o.nfs.indexOf(m.nf)<0) o.nfs.push(m.nf); if(m.dt && (!o.desde || m.dt<o.desde)) o.desde=m.dt; } });
     movs.forEach(function(m){
-      if(m.t!=='E' || !m.m || codOp(m.op)==='021') return;
-      var n=norm(m.op); if(n.indexOf('COMPRA')<0 && n.indexOf('ENTREGA FUTURA')<0) return;
+      /* nota filha que gera estoque: insumos 229 · materiais de embalagens 245 */
+      if(m.t!=='E' || filhaOps.indexOf(codOp(m.op))<0) return;
       var o=g[m.u+'|'+(m.doc||m.p)+'|'+m.c]; if(!o || (m.dt && o.desde && m.dt<o.desde)) return;
-      o.rec+=m.q; if(m.dt>o.ultima) o.ultima=m.dt;
+      o.rec+=m.q; if(m.dt>o.ultima) o.ultima=m.dt; if(m.nf && o.nfsFilha.indexOf(m.nf)<0) o.nfsFilha.push(m.nf);
     });
     return Object.keys(g).map(function(k){ var o=g[k]; o.fat=r6(o.fat); o.rec=r6(o.rec); o.saldo=r6(o.fat-o.rec); o.d=nomeDe(o); o.un=unDe(o); return o; });
   }
-  function linhasEspecial(kind){
-    var f=state.filters.estoque, q=norm(f.q), out=[];
+  function linhasEspecial(kind, filtro){
+    var f=filtro||state.filters.estoque, q=norm(f.q), out=[];
     var nomeEmb=function(o){ var p=IDX.prod[key(o.u,o.c)]; return p?p.d:o.c; }, unEmb=function(o){ var p=IDX.prod[key(o.u,o.c)]; return p?p.un:''; };
     if(kind==='dho') out = saldoPorNatureza(['233'],['234']).map(function(o){ return {sit:'No depósito', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; });
     else if(kind==='emp') out = saldoPorNatureza(['071'],['072']).map(function(o){ return {sit:'Emprestamos (a receber)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; })
         .concat(saldoPorNatureza(['070'],['032']).map(function(o){ return {sit:'Pegamos emprestado (a devolver)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; }));
-    else if(kind==='embrec') out = aReceber(state.base.movimentos||[], nomeEmb, unEmb).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde}; });
-    else if(kind==='insrec') out = aReceber(state.base.insumoMovs||[], function(o){ return (state.base.insumoCad||{})[o.c]||o.c; }, function(){ return ''; }).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde}; });
+    else if(kind==='embrec') out = aReceber(state.base.movimentos||[], nomeEmb, unEmb, ['245']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
+    else if(kind==='insrec') out = aReceber(state.base.insumoMovs||[], function(o){ return (state.base.insumoCad||{})[o.c]||o.c; }, function(){ return ''; }, ['229']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
     return out.filter(function(o){
       if(f.status!=='todos_esp' && Math.abs(o.saldo)<1e-9) return false;
       if(q && norm(o.d+' '+o.c+' '+o.p+' '+o.doc).indexOf(q)<0) return false;
@@ -1176,8 +1180,8 @@
   var ESP_INFO = {
     dho:{titulo:'Depósito externo DHO', a:'Remetido (233)', b:'Retornado (234)', s:'Saldo no depósito', parc:'Depositário', data:'Última nota', hint:'Saldo = remessas para depósito (natureza 233) − retornos do depósito (234).'},
     emp:{titulo:'Empréstimo de materiais de embalagens', a:'Saiu/entrou (071·070)', b:'Voltou (072·032)', s:'Saldo', parc:'Parceiro', data:'Última nota', hint:'A receber = saída por empréstimo (071) − retorno de empréstimo (072). A devolver = entrada por empréstimo (070) − devolução de empréstimo (032).'},
-    embrec:{titulo:'Materiais de embalagens a receber', a:'Faturado (021)', b:'Já recebido', s:'Saldo a receber', parc:'Fornecedor', data:'Faturado desde', hint:'Saldo = notas de entrega futura (021) − entradas de compra que movimentam estoque do mesmo fornecedor e item, a partir da data da 021.'},
-    insrec:{titulo:'Insumos a receber', a:'Faturado (021)', b:'Já recebido', s:'Saldo a receber', parc:'Fornecedor', data:'Faturado desde', hint:'Insumos (Dormex, Ciatide, Kamab…) que não estão no estoque fiscal de embalagens. Saldo = entrega futura (021) − entradas de compra posteriores do mesmo fornecedor e item.'}
+    embrec:{titulo:'Materiais de embalagens a receber', filha:'245', a:'Nota mãe (021)', b:'Notas filhas (245)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Saldo = nota mãe de entrega futura (021 ENTREGA FUTURA - ENTRADA) − notas filhas de entrada que geram estoque (natureza 245) do mesmo fornecedor e item, a partir da data da nota mãe.'},
+    insrec:{titulo:'Insumos a receber', filha:'229', a:'Nota mãe (021)', b:'Notas filhas (229)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Insumos (Dormex, Ciatide, Kamab…) fora do estoque fiscal de embalagens. Saldo = nota mãe de entrega futura (021 ENTREGA FUTURA - ENTRADA) − notas filhas que geram estoque (229 COMPRA DE INSUMOS PARA COMERC.) do mesmo fornecedor e item, a partir da data da nota mãe.'}
   };
   function renderEstoqueEspecial(){
     var f=state.filters.estoque, kind=f.unidade, info=ESP_INFO[kind], L=linhasEspecial(kind);
@@ -1203,6 +1207,41 @@
       resumo+
       '<div class="table-wrap"><table class="wide"><thead><tr>'+(kind==='emp'?'<th>Situação</th>':'')+'<th>Unid.</th><th class="num">Código</th><th>Descrição</th><th>UN</th><th>'+info.parc+'</th><th class="num">'+info.a+'</th><th class="num">'+info.b+'</th><th class="num">'+info.s+'</th><th>'+info.data+'</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
     '</section>';
+  }
+
+  /* Abas "Insumos a receber" e "Embalagens a receber" */
+  function renderAReceber(kind){
+    var f=state.filters[kind], info=ESP_INFO[kind], L=linhasEspecial(kind, f);
+    var semInsumos = kind==='insrec' && !(state.base.insumoMovs && state.base.insumoMovs.length);
+    var tot={}; L.forEach(function(o){ var x=tot[o.c]||(tot[o.c]={d:o.d,un:o.un,saldo:0,fat:0,rec:0}); x.saldo=r6(x.saldo+o.saldo); x.fat=r6(x.fat+o.a); x.rec=r6(x.rec+o.b); });
+    var totList=Object.keys(tot).map(function(k){ return tot[k]; }).sort(function(a,b){ return a.d.localeCompare(b.d); });
+    var abertas = L.filter(function(o){ return o.saldo>1e-9; }).length;
+    var rows = L.length ? L.map(function(o){
+      var pct = o.a>0 ? Math.min(100, Math.round(o.b/o.a*100)) : 0;
+      return '<tr><td>'+nomeUnidade(o.u)+'</td><td>'+esc(o.p)+'<div class="hint">'+esc(o.doc)+'</div></td><td class="num">'+esc(o.c)+'</td><td class="desc"><strong>'+esc(o.d)+'</strong></td>'+
+        '<td>'+esc(o.nfs||'')+'<div class="hint">'+fmtDateBR(o.data)+'</div></td><td class="num">'+fmtN(o.a)+'</td>'+
+        '<td class="num">'+fmtN(o.b)+(o.nfsFilha?'<div class="hint">NF '+esc(o.nfsFilha)+'</div>':'')+'</td>'+
+        '<td class="num"><strong class="'+(o.saldo<0?'neg':'')+'">'+fmtN(o.saldo)+'</strong> '+esc(o.un)+'</td>'+
+        '<td style="min-width:120px"><div class="progress" style="min-width:90px"><span style="width:'+pct+'%"></span></div><div class="hint">'+pct+'% recebido</div></td></tr>'; }).join('')
+      : '<tr><td colspan="9"><div class="empty-msg">'+(semInsumos?'Ainda não há insumos no histórico. Importe a planilha de novo nesta versão para o app guardar os insumos.':'Nenhuma nota mãe (021) com saldo a receber no histórico importado.')+'</div></td></tr>';
+    return '<section class="tab-section">'+
+      '<div class="section-head"><h2>'+esc(info.titulo)+'</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-rec" data-kind="'+kind+'">Exportar Excel</button></div></div>'+
+      '<div class="hint-box">'+esc(info.hint)+'</div>'+
+      '<div class="kpi-grid"><div class="kpi tone-warn"><div class="num">'+abertas+'</div><div class="label">notas mãe com saldo a receber (por fornecedor e item)</div></div>'+
+        '<div class="kpi"><div class="num">'+totList.filter(function(x){ return x.saldo>1e-9; }).length+'</div><div class="label">itens diferentes ainda a receber</div></div></div>'+
+      '<div class="filters"><input class="search-input" id="f-'+kind+'-q" data-filter="'+kind+'.q" placeholder="Buscar item, fornecedor ou NF…" value="'+esc(f.q)+'">'+
+        sel(kind+'.status', f.status, [['saldo','Só com saldo a receber'],['todos_esp','Todas, inclusive já recebidas']])+'</div>'+
+      (totList.length?'<div class="panel" style="margin-bottom:16px"><h3>Total a receber por item</h3>'+totList.map(function(x){
+        return '<div class="alert-row"><div>'+esc(x.d)+'<div class="meta">nota mãe '+fmtN(x.fat)+' · recebido '+fmtN(x.rec)+'</div></div><strong class="'+(x.saldo<0?'neg':'')+'">'+fmtN(x.saldo)+' '+esc(x.un)+'</strong></div>'; }).join('')+'</div>':'')+
+      '<div class="table-wrap"><table class="wide"><thead><tr><th>Unid.</th><th>Fornecedor</th><th class="num">Código</th><th>Descrição</th><th>NF mãe (021)</th><th class="num">Qtd nota mãe</th><th class="num">Recebido ('+info.filha+')</th><th class="num">Saldo a receber</th><th>Andamento</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '<div class="hint" style="margin-top:8px">Histórico considerado: '+fmtDateBR(state.base.periodo.ini)+' a '+fmtDateBR(state.base.periodo.fim)+'. Importe os meses anteriores para incluir notas mãe mais antigas.</div>'+
+    '</section>';
+  }
+  function exportAReceber(kind){
+    var info=ESP_INFO[kind];
+    var cab=['Unidade','Fornecedor','CPF/CNPJ','Código','Descrição','UN','NF mãe (021)','Data nota mãe','Qtd nota mãe','NFs filhas ('+info.filha+')','Recebido ('+info.filha+')','Saldo a receber'];
+    var linhas=linhasEspecial(kind, state.filters[kind]).map(function(o){ return [nomeUnidade(o.u),o.p,o.doc,o.c,o.d,o.un,o.nfs||'',fmtDateBR(o.data),o.a,o.nfsFilha||'',o.b,o.saldo]; });
+    exportarExcel(kind+'-a-receber-'+todayISO()+'.xlsx', [{nome:info.titulo.slice(0,31), cab:cab, linhas:linhas}]);
   }
 
   function renderEstoque(){
@@ -1634,6 +1673,7 @@
       else if(a==='excluir-import') excluirImportacao(el.getAttribute('data-id'));
       else if(a==='export-dho') exportDho();
       else if(a==='export-emp') exportEmp();
+      else if(a==='export-rec') exportAReceber(el.getAttribute('data-kind'));
       else if(a==='open-usuario-new'){ document.getElementById('form-usuario').reset(); document.getElementById('dlg-usuario').showModal(); }
       else if(a==='close-dialog'){ document.getElementById(el.getAttribute('data-dlg')).close(); }
       else if(a==='toggle-usuario-ativo') toggleUsuarioAtivo(el.getAttribute('data-id'));
