@@ -669,6 +669,7 @@
     if(subscribed) return; subscribed = true;
     (async function(){
       try{ await migrarSeNecessario(); }catch(e){ permErr(e); }
+      await lerInfoBackup();
       await sincronizar();
       setInterval(sincronizar, 20000);
     })();
@@ -1705,18 +1706,102 @@
     return '<section class="tab-section"><div class="section-head"><h2>Usuários</h2><div class="toolbar"><button class="btn btn-primary" data-action="open-usuario-new">+ Novo usuário</button></div></div>'+
       '<div class="hint-box">Os usuários são compartilhados com o <strong>Controle de EPI</strong>. Desativar alguém aqui também bloqueia o acesso ao app de EPI.'+(list.length?'':' Se a lista aparecer vazia, os usuários também podem ser vistos no Firebase → Authentication.')+'</div>'+
       '<div class="table-wrap"><table><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></section>'+
-      '<section class="tab-section"><div class="section-head"><h2>Backup e permissões</h2></div>'+
-      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px"><button class="btn btn-secondary" data-action="baixar-backup">Baixar backup (.json)</button></div>'+
-      '<div class="hint">Se aparecer "sem permissão" ao salvar, libere as coleções deste app nas regras do Firestore (console do Firebase → Firestore → Regras), junto das regras que já existem:</div>'+
-      '<pre style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:.8rem;overflow:auto;margin-top:8px">match /emb_base/{doc} { allow read, write: if request.auth != null; }\nmatch /emb_importacoes/{doc} { allow read, write: if request.auth != null; }\nmatch /emb_contagens/{doc} { allow read, write: if request.auth != null; }</pre></section>';
+      '<section class="tab-section"><div class="section-head"><h2>Backup</h2></div>'+
+      '<div class="hint-box">O backup baixa <strong>tudo</strong> que está salvo no app: todas as movimentações de todos os meses, o estoque fiscal de embalagens, o estoque de uva, as contagens diárias e o histórico de importações. '+
+        'Recomendação: baixe <strong>toda semana</strong> (e sempre no fechamento do mês) e guarde no Google Drive ou numa pasta do computador.</div>'+
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">'+
+        '<button class="btn btn-primary" data-action="baixar-backup">Baixar backup completo (.json)</button>'+
+        '<button class="btn btn-secondary" data-action="baixar-backup-excel">Baixar backup em Excel</button>'+
+        '<label class="btn btn-ghost" style="cursor:pointer">Restaurar backup…<input type="file" id="file-restaurar" accept=".json,application/json" style="display:none"></label>'+
+      '</div>'+
+      '<div class="hint">'+(backupInfo&&backupInfo.ultimo ? 'Último backup: <strong>'+fmtDateBR(backupInfo.ultimo.slice(0,10))+' '+backupInfo.ultimo.slice(11,16)+'</strong> por '+esc(backupInfo.por||'')+' ('+(backupInfo.formato==='excel'?'Excel':'completo')+')' : 'Nenhum backup registrado ainda.')+'</div>'+
+      '<div class="hint" id="backup-status" style="margin-top:6px;color:var(--ink)">'+esc(backupMsg)+'</div>'+
+      '<div class="hint" style="margin-top:10px">O arquivo <strong>.json</strong> é o que permite restaurar o app. O <strong>Excel</strong> é para consultar e arquivar.</div></section>';
   }
-  function baixarBackup(){
+  /* ---------- Backup completo ---------- */
+  var backupInfo = null;
+  async function coletarBackup(progresso){
+    var docs = {};
+    async function pega(path){ var d=await db.doc(path).get(); if(d.exists) docs[path]=d.data(); return d.exists?d.data():null; }
+    progresso('Lendo índices…');
+    var mi = await pega('emb_meta/importacoes');
+    var mm = await pega('emb_meta/meses');
+    var mc = await pega('emb_meta/contagens');
+    await pega('emb_base/atual'); await pega('emb_uva/atual');
+    var meses = Object.keys((mm&&mm.meses)||{}).sort();
+    for(var k=0;k<meses.length;k++){ progresso('Lendo movimentação '+meses[k]+' ('+(k+1)+'/'+meses.length+')…'); await pega('emb_mov/'+meses[k]); }
+    var ids = Object.keys((mc&&mc.ids)||{}).sort();
+    for(var c=0;c<ids.length;c++){ if(c%10===0) progresso('Lendo contagens ('+(c+1)+'/'+ids.length+')…'); await pega('emb_contagens/'+ids[c]); }
+    var imps = ((mi&&mi.lista)||[]).map(function(x){ return x.id; });
+    for(var q=0;q<imps.length;q++){ await pega('emb_importacoes/'+imps[q]); }
+    return {app:'valexfruit-estoque-embalagens', versao:2, geradoEm:new Date().toISOString(), geradoPor:registradoPor(), docs:docs};
+  }
+  function baixarArquivo(nome, conteudo, tipo){
+    var url = URL.createObjectURL(new Blob([conteudo], {type:tipo}));
+    var a=document.createElement('a'); a.href=url; a.download=nome; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+  }
+  async function registrarBackup(formato){
     try{
-      var json = JSON.stringify({geradoEm:new Date().toISOString(), base:state.base, importacoes:state.importacoes, contagens:state.contagens}, null, 2);
-      var url = URL.createObjectURL(new Blob([json], {type:'application/json'}));
-      var a=document.createElement('a'); a.href=url; a.download='backup-estoque-embalagens-'+todayISO()+'.json'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
-    }catch(e){ alert('Não foi possível gerar o backup agora.'); }
+      backupInfo = {ultimo:new Date().toISOString(), por:registradoPor(), formato:formato};
+      await db.doc('emb_meta/backup').set(backupInfo);
+    }catch(e){}
+  }
+  async function lerInfoBackup(){ try{ backupInfo = await lerMeta('backup', null); }catch(e){} }
+  var backupMsg=''; function setBackupStatus(t){ backupMsg=t; var el=document.getElementById('backup-status'); if(el) el.textContent=t; }
+  var backupRodando=false;
+  async function baixarBackup(){
+    if(backupRodando) return; backupRodando=true;
+    try{
+      var b = await coletarBackup(setBackupStatus);
+      baixarArquivo('backup-estoque-valexfruit-'+todayISO()+'.json', JSON.stringify(b), 'application/json');
+      await registrarBackup('json');
+      setBackupStatus('Backup completo baixado: '+Object.keys(b.docs).length+' documentos. Guarde o arquivo no Google Drive ou no computador.');
+    }catch(e){ setBackupStatus(''); alert('Não foi possível gerar o backup agora.\n\nDetalhe: '+(e&&e.message?e.message.slice(0,300):e)); }
+    backupRodando=false; renderSoft();
+  }
+  async function baixarBackupExcel(){
+    if(backupRodando) return; backupRodando=true;
+    try{
+      var b = await coletarBackup(setBackupStatus), D=b.docs, abas=[];
+      setBackupStatus('Montando o Excel…');
+      var movs=[]; Object.keys(D).filter(function(k){ return k.indexOf('emb_mov/')===0; }).sort().forEach(function(k){
+        var cad=D[k].cad||{};
+        (D[k].movs||[]).forEach(function(m){ movs.push([nomeUnidade(m.u), m.t==='E'?'Entrada':(m.t==='S'?'Saída':m.t), m.nf, m.dt?fmtDateBR(m.dt):'', m.p||'', m.doc||'', m.op||'', m.c, cad[m.c]||'', m.q, m.v==null?'':m.v, m.m||'']); });
+      });
+      abas.push({nome:'Movimentações', cab:['Unidade','Tipo','NF','Data','Parceiro','CPF/CNPJ','Natureza','Código','Descrição','Quantidade','Valor','Mercado'], linhas:movs});
+      [['emb_base/atual','Estoque embalagens'],['emb_uva/atual','Estoque uva']].forEach(function(x){
+        var d=D[x[0]]; if(!d) return;
+        abas.push({nome:x[1], cab:['Unidade','Mercado','Código','Descrição','NCM','UND','Estoque fiscal '+fmtDateBR(d.dataBase)], linhas:(d.produtos||[]).map(function(p){ return [nomeUnidade(p.u),p.mi||'',p.c,p.d,p.ncm||'',p.un||'',p.q]; })});
+      });
+      var desc={}; ((D['emb_base/atual']||{}).produtos||[]).forEach(function(p){ desc[p.c]=p.d; });
+      var cl=[]; Object.keys(D).filter(function(k){ return k.indexOf('emb_contagens/')===0; }).sort().forEach(function(k){
+        var c=D[k]; Object.keys(c.itens||{}).forEach(function(ck){ var cod=ck.slice(1); cl.push([fmtDateBR(c.data), nomeUnidade(c.unidade), cod, desc[cod]||'', c.itens[ck], c.registradoPor||'', c.obs||'']); });
+      });
+      abas.push({nome:'Contagens', cab:['Data','Unidade','Código','Descrição','Qtd contada','Registrado por','Observação'], linhas:cl});
+      abas.push({nome:'Importações', cab:['Data/hora','Tipo','Arquivo','Por','Data base','Período','Itens','Movimentos'], linhas:(((D['emb_meta/importacoes']||{}).lista)||[]).map(function(i){ return [i.importadoEm||'', ({mov:'Movimentação',emb:'Estoque embalagens',uva:'Estoque uva'})[i.tipo||'emb']||i.tipo, i.arquivo||'', i.importadoPor||'', i.dataBase?fmtDateBR(i.dataBase):'', (i.periodoIni?fmtDateBR(i.periodoIni):'')+(i.periodoFim?' a '+fmtDateBR(i.periodoFim):''), i.itens||'', i.movimentos||'']; })});
+      exportarExcel('backup-estoque-valexfruit-'+todayISO()+'.xlsx', abas);
+      await registrarBackup('excel');
+      setBackupStatus('Backup em Excel baixado ('+movs.length+' movimentações, '+cl.length+' itens contados).');
+    }catch(e){ setBackupStatus(''); alert('Não foi possível gerar o backup em Excel agora.\n\nDetalhe: '+(e&&e.message?e.message.slice(0,300):e)); }
+    backupRodando=false; renderSoft();
+  }
+  async function restaurarBackup(file){
+    if(!file) return;
+    var b; try{ b = JSON.parse(await file.text()); }catch(e){ alert('Este arquivo não é um backup válido (.json).'); return; }
+    if(!b || b.app!=='valexfruit-estoque-embalagens' || !b.docs){ alert('Este arquivo não é um backup do Controle de Estoque de Embalagens.\nUse o arquivo .json baixado em "Baixar backup completo".'); return; }
+    var paths = Object.keys(b.docs).filter(function(p){ return /^emb_(base|uva|mov|meta|contagens|importacoes)\/[^\/]+$/.test(p) && p!=='emb_meta/backup'; });
+    if(!confirm('Restaurar o backup de '+fmtDateBR((b.geradoEm||'').slice(0,10))+' ('+paths.length+' documentos)?\n\nOs dados desse backup voltam a valer no lugar dos atuais (estoques, meses de movimentação e contagens que estão no arquivo). Antes de continuar, baixe um backup de hoje por segurança.')) return;
+    if(backupRodando) return; backupRodando=true;
+    try{
+      paths.sort(function(a,c){ return (a.indexOf('emb_meta/')===0) - (c.indexOf('emb_meta/')===0); }); /* índices por último */
+      for(var i=0;i<paths.length;i++){ setBackupStatus('Restaurando '+(i+1)+'/'+paths.length+'…'); await db.doc(paths[i]).set(b.docs[paths[i]]); }
+      cacheMeses={}; contagensVersao={}; state.contagens=[]; state.impSig='';
+      setBackupStatus('Backup restaurado. Recarregando os dados…');
+      await sincronizar();
+      setBackupStatus('Backup de '+fmtDateBR((b.geradoEm||'').slice(0,10))+' restaurado com sucesso.');
+    }catch(e){ alert('A restauração parou no meio. Tente de novo com o mesmo arquivo.\n\nDetalhe: '+(e&&e.message?e.message.slice(0,300):e)); }
+    backupRodando=false;
   }
 
   /* ================= Eventos ================= */
@@ -1754,6 +1839,7 @@
       else if(a==='toggle-usuario-ativo') toggleUsuarioAtivo(el.getAttribute('data-id'));
       else if(a==='reset-senha') resetSenhaUsuario(el.getAttribute('data-email'));
       else if(a==='baixar-backup') baixarBackup();
+      else if(a==='baixar-backup-excel') baixarBackupExcel();
     });
     document.addEventListener('input', function(e){
       var t=e.target;
@@ -1764,6 +1850,7 @@
     });
     document.addEventListener('change', function(e){
       var t=e.target;
+      if(t.id==='file-restaurar'){ restaurarBackup(t.files && t.files[0]); t.value=''; return; }
       if(t.id==='file-xlsx'){ lerArquivo(t.files && t.files[0], tipoImport); tipoImport=null; t.value=''; return; }
       var cnt=t.getAttribute('data-cnt');
       if(cnt==='data' || cnt==='unidade'){
