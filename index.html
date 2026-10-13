@@ -611,26 +611,75 @@
     else setSync(false, 'Sem conexão — tentando de novo…');
     var pill=document.getElementById('sync-pill'); if(pill) pill.title = ultimoErroBanco;
   }
+  /* Sem depender de "listar coleção" (o banco recusa listagens nesta configuração):
+     cada lista fica num documento-índice em emb_meta, e os documentos são lidos um a um. */
+  function ordenarContagens(){ state.contagens.sort(function(a,b){ return (b.data||'').localeCompare(a.data||'') || (a.unidade||'').localeCompare(b.unidade||''); }); }
+  async function lerMeta(nome, padrao){
+    var d = await db.doc('emb_meta/'+nome).get();
+    return d.exists ? d.data() : padrao;
+  }
+  async function migrarSeNecessario(){
+    /* primeira vez nesta versão: monta o índice a partir do que já existe */
+    var meta = await db.doc('emb_meta/importacoes').get();
+    if(meta.exists) return;
+    var lista = [];
+    var base = await db.doc('emb_base/atual').get();
+    if(base.exists){
+      var b = base.data(), id = b.importId;
+      if(id){
+        var info = await db.doc('emb_importacoes/'+id).get();
+        var i = info.exists ? info.data() : {};
+        lista.push({ id:id, importadoEm:i.importadoEm||b.importadoEm||'', importadoPor:i.importadoPor||b.importadoPor||'', arquivo:i.arquivo||b.arquivo||'',
+          dataBase:i.dataBase||b.dataBase||'', horaBase:i.horaBase||b.horaBase||'', periodoIni:i.periodoIni||(b.periodo&&b.periodo.ini)||'', periodoFim:i.periodoFim||(b.periodo&&b.periodo.fim)||'',
+          itens:i.itens||(b.produtos||[]).length, movimentos:i.movimentos||(b.movimentos||[]).length });
+      }
+    }
+    await db.doc('emb_meta/importacoes').set({lista:lista});
+  }
+  var contagensVersao = {};
+  async function sincronizar(){
+    try{
+      var mi = await lerMeta('importacoes', {lista:[]});
+      state.importacoes = (mi.lista||[]).slice().sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
+      var sig = state.importacoes.map(function(i){ return i.id; }).sort().join(',');
+      if(sig!==state.impSig) await carregarBase();
+      var mc = await lerMeta('contagens', {ids:{}});
+      var ids = Object.keys(mc.ids||{}).sort().reverse().slice(0,90);
+      var mudou=false;
+      for(var k=0;k<ids.length;k++){
+        var id=ids[k];
+        if(contagensVersao[id]===mc.ids[id]) continue;
+        var d = await db.doc('emb_contagens/'+id).get();
+        if(d.exists){
+          var novo = Object.assign({id:id}, d.data());
+          var ix = state.contagens.findIndex(function(x){ return x.id===id; });
+          if(ix>=0) state.contagens[ix]=novo; else state.contagens.push(novo);
+          mudou=true;
+        }
+        contagensVersao[id]=mc.ids[id];
+      }
+      if(mudou) ordenarContagens();
+      setSync(true, 'Sincronizado — dados salvos para toda a equipe'); ultimoErroBanco='';
+      renderSoft();
+    }catch(e){ permErr(e); renderSoft(); }
+  }
+  async function atualizarMeta(nome, padrao, fn){
+    var atual = await lerMeta(nome, padrao);
+    var novo = fn(JSON.parse(JSON.stringify(atual)));
+    await db.doc('emb_meta/'+nome).set(novo);
+    return novo;
+  }
   function subscribeAll(){
     if(subscribed) return; subscribed = true;
-    db.collection('emb_importacoes').onSnapshot(function(snap){
-      state.importacoes = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); })
-        .sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
-      var sig = state.importacoes.map(function(i){ return i.id; }).sort().join(',');
-      if(sig && sig!==state.impSig) carregarBase();
-      setSync(true, 'Sincronizado — dados salvos para toda a equipe'); ultimoErroBanco='';
-      render();
-    }, permErr);
-    db.collection('emb_contagens').onSnapshot(function(snap){
-      state.contagens = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); })
-        .sort(function(a,b){ return (b.data||'').localeCompare(a.data||'') || (a.unidade||'').localeCompare(b.unidade||''); });
-      renderSoft();
-    }, permErr);
-    db.collection('usuarios').onSnapshot(function(snap){
+    (async function(){
+      try{ await migrarSeNecessario(); }catch(e){ permErr(e); }
+      await sincronizar();
+      setInterval(sincronizar, 20000);
+    })();
+    db.collection('usuarios').get().then(function(snap){
       state.usuarios = snap.docs.map(function(d){ return Object.assign({uid:d.id}, d.data()); });
       renderSoft();
     }, function(){});
-    carregarBase();
   }
   /* Junta os movimentos de todas as planilhas importadas (histórico completo).
      Notas repetidas entre planilhas com períodos sobrepostos são contadas uma vez só. */
@@ -656,15 +705,19 @@
     b.qtdPlanilhas = imps.length;
     return b;
   }
-  var carregandoBase = false;
+  var carregandoBase = false, cacheImports = {};
   async function carregarBase(){
     if(carregandoBase) return; carregandoBase = true;
     try{
       var doc = await db.doc('emb_base/atual').get();
       var base = doc.exists ? doc.data() : null;
       var imps = [];
-      try{ var snap = await db.collection('emb_imports').get(); imps = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); }); }
-      catch(e){ permErr(e); }
+      for(var ii=0; ii<state.importacoes.length; ii++){
+        var iid = state.importacoes[ii].id;
+        if(cacheImports[iid]){ imps.push(cacheImports[iid]); continue; }
+        try{ var dd = await db.doc('emb_imports/'+iid).get(); if(dd.exists){ cacheImports[iid] = Object.assign({id:iid}, dd.data()); imps.push(cacheImports[iid]); } }
+        catch(e){ permErr(e); }
+      }
       state.legacy = (base && base.movimentos && base.movimentos.length) ? base : null;
       if(state.legacy && !imps.some(function(i){ return i.id===base.importId; })){
         imps.push({id:base.importId, importadoEm:base.importadoEm, arquivo:base.arquivo, periodo:base.periodo, movimentos:base.movimentos, insumoMovs:base.insumoMovs||[], insumoCad:base.insumoCad||{}});
@@ -832,10 +885,12 @@
       await db.doc('emb_imports/'+id).set(imp);
       var base = { importId:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase, periodoArquivo:p.periodo, produtos:p.produtos };
       await db.doc('emb_base/atual').set(base);
-      await db.doc('emb_importacoes/'+id).set({ importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase,
-        periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length });
+      var infoImp = { importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase,
+        periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length };
+      await db.doc('emb_importacoes/'+id).set(infoImp);
+      var metaNova = await atualizarMeta('importacoes', {lista:[]}, function(m){ m.lista=(m.lista||[]).filter(function(x){ return x.id!==id; }); m.lista.push(Object.assign({id:id}, infoImp)); return m; });
+      state.importacoes = metaNova.lista.slice().sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
       state.impSig = '';
-      state.importacoes.unshift({id:id, importadoEm:agora, importadoPor:registradoPor(), arquivo:p.arquivo, dataBase:p.dataBase, horaBase:p.horaBase, periodoIni:p.periodo.ini, periodoFim:p.periodo.fim, itens:p.produtos.length, movimentos:p.movimentos.length});
       state.preview = null; state.tab='estoque';
       await carregarBase();
     }catch(e){
@@ -850,7 +905,9 @@
     try{
       await db.doc('emb_imports/'+id).remove();
       await db.doc('emb_importacoes/'+id).remove();
-      state.importacoes = state.importacoes.filter(function(x){ return x.id!==id; });
+      var mn = await atualizarMeta('importacoes', {lista:[]}, function(m){ m.lista=(m.lista||[]).filter(function(x){ return x.id!==id; }); return m; });
+      state.importacoes = mn.lista.slice().sort(function(a,b){ return (b.importadoEm||'').localeCompare(a.importadoEm||''); });
+      delete cacheImports[id];
       state.impSig=''; await carregarBase();
     }catch(e){ alert('Não foi possível excluir agora.\n\nDetalhe técnico: '+(e && e.message ? e.message.slice(0,300) : e)); }
   }
@@ -1277,12 +1334,14 @@
     try{
       var docData = {data:c.data, unidade:c.unidade, itens:itens, obs:state.draftObs[docId]||'', registradoPor:registradoPor(), atualizadoEm:new Date().toISOString(), baseImportId: state.base?state.base.importId:''};
       await db.doc('emb_contagens/'+docId).set(docData);
+      await atualizarMeta('contagens', {ids:{}}, function(m){ m.ids = m.ids||{}; m.ids[docId]=docData.atualizadoEm; return m; });
+      contagensVersao[docId]=docData.atualizadoEm;
       var i = state.contagens.findIndex(function(x){ return x.id===docId; });
       var novo = Object.assign({id:docId}, docData);
-      if(i>=0) state.contagens[i]=novo; else { state.contagens.push(novo); state.contagens.sort(function(a,b){ return (b.data||'').localeCompare(a.data||'') || (a.unidade||'').localeCompare(b.unidade||''); }); }
+      if(i>=0) state.contagens[i]=novo; else { state.contagens.push(novo); ordenarContagens(); }
       delete state.draft[docId];
     }catch(e){
-      alert(e && e.status===403 ? 'O banco recusou a gravação (permissão). Peça ao administrador para liberar as coleções "emb_" no Firebase (veja a aba Usuários).' : 'Não foi possível salvar agora. Seus números continuam na tela — tente de novo.');
+      alert('Não foi possível salvar a contagem agora. Seus números continuam na tela — tente de novo.\n\nDetalhe técnico: '+(e && e.message ? e.message.slice(0,300) : e));
     }
     state.salvandoContagem=false; render();
   }
@@ -1531,7 +1590,7 @@
         '<td><div class="row-actions"><button class="btn btn-ghost" data-action="reset-senha" data-email="'+esc(u.email)+'">Enviar redefinição de senha</button><button class="btn btn-ghost" data-action="toggle-usuario-ativo" data-id="'+esc(u.uid)+'">'+(ativo?'Desativar':'Reativar')+'</button></div></td></tr>'; }).join('')
       : '<tr><td colspan="5"><div class="empty-msg">Nenhum usuário.</div></td></tr>';
     return '<section class="tab-section"><div class="section-head"><h2>Usuários</h2><div class="toolbar"><button class="btn btn-primary" data-action="open-usuario-new">+ Novo usuário</button></div></div>'+
-      '<div class="hint-box">Os usuários são compartilhados com o <strong>Controle de EPI</strong>. Desativar alguém aqui também bloqueia o acesso ao app de EPI.</div>'+
+      '<div class="hint-box">Os usuários são compartilhados com o <strong>Controle de EPI</strong>. Desativar alguém aqui também bloqueia o acesso ao app de EPI.'+(list.length?'':' Se a lista aparecer vazia, os usuários também podem ser vistos no Firebase → Authentication.')+'</div>'+
       '<div class="table-wrap"><table><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></section>'+
       '<section class="tab-section"><div class="section-head"><h2>Backup e permissões</h2></div>'+
       '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px"><button class="btn btn-secondary" data-action="baixar-backup">Baixar backup (.json)</button></div>'+
