@@ -1173,12 +1173,13 @@
   var LOCAIS_EST = [['todas','Todas as unidades'],['MATRIZ','Matriz'],['FILIAL','Filial'],['DHO','Depósito DHO (estoque fiscal)'],['dho','Depósito externo DHO'],['emp','Empréstimo de materiais de embalagens'],['embrec','Materiais de embalagens a receber'],['insrec','Insumos a receber']];
   function ehLocalEspecial(u){ return ['dho','emp','embrec','insrec'].indexOf(u)>=0; }
 
-  /* Entrega futura: faturado (021) − recebido depois (entradas de compra com MOV. ESTOQUE = Sim, mesmo fornecedor e item) */
-  function aReceber(movs, nomeDe, unDe, filhaOps){
+  /* Entrega futura: nota mãe (insumos 021, embalagens 246) − recebido depois (entradas de compra com MOV. ESTOQUE = Sim, mesmo fornecedor e item) */
+  function aReceber(movs, nomeDe, unDe, filhaOps, maeOps){
+    maeOps = maeOps || ['021'];
     var g={};
-    movs.forEach(function(m){ if(m.t==='E' && codOp(m.op)==='021'){ var k=m.u+'|'+(m.doc||m.p)+'|'+m.c; var o=g[k]||(g[k]={u:m.u,p:m.p,doc:m.doc,c:m.c,fat:0,rec:0,desde:m.dt||'',ultima:'',vFat:0,nfs:[],nfsFilha:[]}); o.fat+=m.q; o.vFat+=m.v; if(m.nf && o.nfs.indexOf(m.nf)<0) o.nfs.push(m.nf); if(m.dt && (!o.desde || m.dt<o.desde)) o.desde=m.dt; } });
+    movs.forEach(function(m){ if(m.t==='E' && maeOps.indexOf(codOp(m.op))>=0){ var k=m.u+'|'+(m.doc||m.p)+'|'+m.c; var o=g[k]||(g[k]={u:m.u,p:m.p,doc:m.doc,c:m.c,fat:0,rec:0,desde:m.dt||'',ultima:'',vFat:0,nfs:[],nfsFilha:[]}); o.fat+=m.q; o.vFat+=m.v; if(m.nf && o.nfs.indexOf(m.nf)<0) o.nfs.push(m.nf); if(m.dt && (!o.desde || m.dt<o.desde)) o.desde=m.dt; } });
     movs.forEach(function(m){
-      /* nota filha que gera estoque: insumos 229 · materiais de embalagens 245 */
+      /* nota mãe: insumos 021 · embalagens 246 (e 021 antigas) — nota filha que gera estoque: insumos 229 · embalagens 245 */
       if(m.t!=='E' || filhaOps.indexOf(codOp(m.op))<0) return;
       var o=g[m.u+'|'+(m.doc||m.p)+'|'+m.c]; if(!o || (m.dt && o.desde && m.dt<o.desde)) return;
       o.rec+=m.q; if(m.dt>o.ultima) o.ultima=m.dt; if(m.nf && o.nfsFilha.indexOf(m.nf)<0) o.nfsFilha.push(m.nf);
@@ -1191,8 +1192,8 @@
     if(kind==='dho') out = saldoPorNatureza(['233'],['234']).map(function(o){ return {sit:'No depósito', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; });
     else if(kind==='emp') out = saldoPorNatureza(['071'],['072']).map(function(o){ return {sit:'Emprestamos (a receber)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; })
         .concat(saldoPorNatureza(['070'],['032']).map(function(o){ return {sit:'Pegamos emprestado (a devolver)', u:o.u,p:o.p,doc:o.doc,c:o.c,d:nomeEmb(o),un:unEmb(o),a:o.abre,b:o.fecha,saldo:o.saldo,data:o.ultima}; }));
-    else if(kind==='embrec') out = aReceber(state.base.movimentos||[], nomeEmb, unEmb, ['245']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
-    else if(kind==='insrec') out = aReceber(state.base.insumoMovs||[], function(o){ return (state.base.insumoCad||{})[o.c]||o.c; }, function(){ return ''; }, ['229']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
+    else if(kind==='embrec') out = aReceber(state.base.movimentos||[], nomeEmb, unEmb, ['245'], ['246','021']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
+    else if(kind==='insrec') out = aReceber(state.base.insumoMovs||[], function(o){ return (state.base.insumoCad||{})[o.c]||o.c; }, function(){ return ''; }, ['229'], ['021']).map(function(o){ return {sit:'A receber', u:o.u,p:o.p,doc:o.doc,c:o.c,d:o.d,un:o.un,a:o.fat,b:o.rec,saldo:o.saldo,data:o.desde,nfs:o.nfs.join(', '),nfsFilha:o.nfsFilha.join(', ')}; });
     return out.filter(function(o){
       if(f.status!=='todos_esp' && Math.abs(o.saldo)<1e-9) return false;
       if(q && norm(o.d+' '+o.c+' '+o.p+' '+o.doc).indexOf(q)<0) return false;
@@ -1202,8 +1203,8 @@
   var ESP_INFO = {
     dho:{titulo:'Depósito externo DHO', a:'Remetido (233)', b:'Retornado (234)', s:'Saldo no depósito', parc:'Depositário', data:'Última nota', hint:'Saldo = remessas para depósito (natureza 233) − retornos do depósito (234).'},
     emp:{titulo:'Empréstimo de materiais de embalagens', a:'Saiu/entrou (071·070)', b:'Voltou (072·032)', s:'Saldo', parc:'Parceiro', data:'Última nota', hint:'A receber = saída por empréstimo (071) − retorno de empréstimo (072). A devolver = entrada por empréstimo (070) − devolução de empréstimo (032).'},
-    embrec:{titulo:'Materiais de embalagens a receber', filha:'245', a:'Nota mãe (021)', b:'Notas filhas (245)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Saldo = nota mãe de entrega futura (021 ENTREGA FUTURA - ENTRADA) − notas filhas de entrada que geram estoque (natureza 245) do mesmo fornecedor e item, a partir da data da nota mãe.'},
-    insrec:{titulo:'Insumos a receber', filha:'229', a:'Nota mãe (021)', b:'Notas filhas (229)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Insumos (Dormex, Ciatide, Kamab…) fora do estoque fiscal de embalagens. Saldo = nota mãe de entrega futura (021 ENTREGA FUTURA - ENTRADA) − notas filhas que geram estoque (229 COMPRA DE INSUMOS PARA COMERC.) do mesmo fornecedor e item, a partir da data da nota mãe.'}
+    embrec:{titulo:'Materiais de embalagens a receber', mae:'246', filha:'245', a:'Nota mãe (246)', b:'Notas filhas (245)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Saldo = nota mãe de entrega futura (246 ENTREGA FUTURA - EMBALAGENS) − notas filhas de entrada que geram estoque (245 ENTRADA EFETIVA - MATERIAIS DE EMBALAGENS) do mesmo fornecedor e item, a partir da data da nota mãe.'},
+    insrec:{titulo:'Insumos a receber', mae:'021', filha:'229', a:'Nota mãe (021)', b:'Notas filhas (229)', s:'Saldo a receber', parc:'Fornecedor', data:'Nota mãe desde', hint:'Insumos (Dormex, Ciatide, Kamab…) fora do estoque fiscal de embalagens. Saldo = nota mãe de entrega futura (021 ENTREGA FUTURA - INSUMOS) − notas filhas que geram estoque (229 ENTRADA EFETIVA - INSUMOS) do mesmo fornecedor e item, a partir da data da nota mãe.'}
   };
   function renderEstoqueEspecial(){
     var f=state.filters.estoque, kind=f.unidade, info=ESP_INFO[kind], L=linhasEspecial(kind);
@@ -1245,7 +1246,7 @@
         '<td class="num">'+fmtN(o.b)+(o.nfsFilha?'<div class="hint" title="'+esc(o.nfsFilha)+'">'+(function(l){ return l.length>3 ? l.length+' notas filhas (última NF '+esc(l[l.length-1])+')' : 'NF '+esc(l.join(', ')); })(o.nfsFilha.split(', '))+'</div>':'')+'</td>'+
         '<td class="num"><strong class="'+(o.saldo<0?'neg':'')+'">'+fmtN(o.saldo)+'</strong> '+esc(o.un)+'</td>'+
         '<td style="min-width:120px"><div class="progress" style="min-width:90px"><span style="width:'+pct+'%"></span></div><div class="hint">'+pct+'% recebido</div></td></tr>'; }).join('')
-      : '<tr><td colspan="9"><div class="empty-msg">'+(semInsumos?'Ainda não há insumos no histórico. Importe a planilha de novo nesta versão para o app guardar os insumos.':'Nenhuma nota mãe (021) com saldo a receber no histórico importado.')+'</div></td></tr>';
+      : '<tr><td colspan="9"><div class="empty-msg">'+(semInsumos?'Ainda não há insumos no histórico. Importe a planilha de novo nesta versão para o app guardar os insumos.':'Nenhuma nota mãe ('+info.mae+') com saldo a receber no histórico importado.')+'</div></td></tr>';
     return '<section class="tab-section">'+
       '<div class="section-head"><h2>'+esc(info.titulo)+'</h2><div class="toolbar"><button class="btn btn-secondary" data-action="export-rec" data-kind="'+kind+'">Exportar Excel</button></div></div>'+
       '<div class="hint-box">'+esc(info.hint)+'</div>'+
@@ -1255,13 +1256,13 @@
         sel(kind+'.status', f.status, [['saldo','Só com saldo a receber'],['todos_esp','Todas, inclusive já recebidas']])+'</div>'+
       (totList.length?'<div class="panel" style="margin-bottom:16px"><h3>Total a receber por item</h3>'+totList.map(function(x){
         return '<div class="alert-row"><div>'+esc(x.d)+'<div class="meta">nota mãe '+fmtN(x.fat)+' · recebido '+fmtN(x.rec)+'</div></div><strong class="'+(x.saldo<0?'neg':'')+'">'+fmtN(x.saldo)+' '+esc(x.un)+'</strong></div>'; }).join('')+'</div>':'')+
-      '<div class="table-wrap"><table class="wide"><thead><tr><th>Unid.</th><th>Fornecedor</th><th class="num">Código</th><th>Descrição</th><th>NF mãe (021)</th><th class="num">Qtd nota mãe</th><th class="num">Recebido ('+info.filha+')</th><th class="num">Saldo a receber</th><th>Andamento</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '<div class="table-wrap"><table class="wide"><thead><tr><th>Unid.</th><th>Fornecedor</th><th class="num">Código</th><th>Descrição</th><th>NF mãe ('+info.mae+')</th><th class="num">Qtd nota mãe</th><th class="num">Recebido ('+info.filha+')</th><th class="num">Saldo a receber</th><th>Andamento</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
       '<div class="hint" style="margin-top:8px">Histórico considerado: '+fmtDateBR(state.base.periodo.ini)+' a '+fmtDateBR(state.base.periodo.fim)+'. Importe os meses anteriores para incluir notas mãe mais antigas.</div>'+
     '</section>';
   }
   function exportAReceber(kind){
     var info=ESP_INFO[kind];
-    var cab=['Unidade','Fornecedor','CPF/CNPJ','Código','Descrição','UN','NF mãe (021)','Data nota mãe','Qtd nota mãe','NFs filhas ('+info.filha+')','Recebido ('+info.filha+')','Saldo a receber'];
+    var cab=['Unidade','Fornecedor','CPF/CNPJ','Código','Descrição','UN','NF mãe ('+info.mae+')','Data nota mãe','Qtd nota mãe','NFs filhas ('+info.filha+')','Recebido ('+info.filha+')','Saldo a receber'];
     var linhas=linhasEspecial(kind, state.filters[kind]).map(function(o){ return [nomeUnidade(o.u),o.p,o.doc,o.c,o.d,o.un,o.nfs||'',fmtDateBR(o.data),o.a,o.nfsFilha||'',o.b,o.saldo]; });
     exportarExcel(kind+'-a-receber-'+todayISO()+'.xlsx', [{nome:info.titulo.slice(0,31), cab:cab, linhas:linhas}]);
   }
